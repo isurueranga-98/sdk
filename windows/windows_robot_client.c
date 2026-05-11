@@ -1,4 +1,10 @@
 // windows_client/windows_robot_client.c
+//
+// Secure Windows robot client:
+//   1. Plain UDP broadcast discovery.
+//   2. TOFU pairing using the robot Ed25519 signing public key.
+//   3. Signed crypto_kx key exchange.
+//   4. Encrypted/authenticated robot data polling with XChaCha20-Poly1305.
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -28,8 +34,14 @@
 
 #define DISCOVERY_REQUEST_MAGIC "RDISCOV"
 #define DISCOVERY_RESPONSE_MAGIC "RRESPON"
-#define DATA_REQUEST_MAGIC "RDATAQ"
-#define DATA_RESPONSE_MAGIC "RDATAR"
+#define KX_REQUEST_MAGIC "RKXREQ"
+#define KX_RESPONSE_MAGIC "RKXRES"
+#define ENCRYPTED_DATA_REQUEST_MAGIC "RENCQ"
+#define ENCRYPTED_DATA_RESPONSE_MAGIC "RENCR"
+#define DATA_REQUEST_MAGIC "EDATAQ"
+#define DATA_RESPONSE_MAGIC "EDATAR"
+
+#define FRESHNESS_WINDOW_SECONDS 10
 
 #pragma pack(push, 1)
 
@@ -57,27 +69,67 @@ typedef struct {
 
 typedef struct {
     char magic[MAGIC_SIZE];
+    char device_id[DEVICE_ID_SIZE];
+    char serial_number[SERIAL_SIZE];
+    unsigned char client_kx_public_key[crypto_kx_PUBLICKEYBYTES];
     uint64_t challenge_nonce;
     uint64_t timestamp;
-} DataRequestPacket;
+} KeyExchangeRequestPacket;
 
 typedef struct {
     char magic[MAGIC_SIZE];
     char device_id[DEVICE_ID_SIZE];
     char serial_number[SERIAL_SIZE];
-    uint32_t sequence_number;
+    unsigned char client_kx_public_key[crypto_kx_PUBLICKEYBYTES];
+    unsigned char server_kx_public_key[crypto_kx_PUBLICKEYBYTES];
+    uint64_t challenge_nonce;
+    uint64_t timestamp;
+} KeyExchangeResponseBody;
+
+typedef struct {
+    KeyExchangeResponseBody body;
+    unsigned char signature[crypto_sign_BYTES];
+} KeyExchangeResponsePacket;
+
+typedef struct {
+    char magic[MAGIC_SIZE];
+    char device_id[DEVICE_ID_SIZE];
+    char serial_number[SERIAL_SIZE];
+    uint32_t request_sequence;
+    uint64_t challenge_nonce;
+    uint64_t timestamp;
+} EncryptedDataRequestBody;
+
+typedef struct {
+    char magic[MAGIC_SIZE];
+    unsigned char nonce[crypto_aead_xchacha20poly1305_ietf_NPUBBYTES];
+    unsigned char ciphertext[
+        sizeof(EncryptedDataRequestBody) +
+        crypto_aead_xchacha20poly1305_ietf_ABYTES
+    ];
+} EncryptedDataRequestPacket;
+
+typedef struct {
+    char magic[MAGIC_SIZE];
+    char device_id[DEVICE_ID_SIZE];
+    char serial_number[SERIAL_SIZE];
+    uint32_t response_sequence;
     uint64_t challenge_nonce;
     uint64_t timestamp;
     int32_t counter;
     float battery_level;
     float temperature;
     char message[MESSAGE_SIZE];
-} DataResponseBody;
+} EncryptedDataResponseBody;
 
 typedef struct {
-    DataResponseBody body;
-    unsigned char signature[crypto_sign_BYTES];
-} DataResponsePacket;
+    char magic[MAGIC_SIZE];
+    unsigned char nonce[crypto_aead_xchacha20poly1305_ietf_NPUBBYTES];
+    unsigned char ciphertext[
+        sizeof(EncryptedDataResponseBody) +
+        crypto_aead_xchacha20poly1305_ietf_ABYTES
+    ];
+} EncryptedDataResponsePacket;
 
 #pragma pack(pop)
 
@@ -95,6 +147,16 @@ typedef struct {
     unsigned char public_key[crypto_sign_PUBLICKEYBYTES];
     int trusted;
 } DiscoveredRobot;
+
+typedef struct {
+    unsigned char client_kx_public_key[crypto_kx_PUBLICKEYBYTES];
+    unsigned char client_kx_private_key[crypto_kx_SECRETKEYBYTES];
+    unsigned char server_kx_public_key[crypto_kx_PUBLICKEYBYTES];
+    unsigned char rx_key[crypto_kx_SESSIONKEYBYTES];
+    unsigned char tx_key[crypto_kx_SESSIONKEYBYTES];
+    uint32_t next_request_sequence;
+    uint32_t last_response_sequence;
+} SecureSession;
 
 static void public_key_to_hex(
     const unsigned char *public_key,
@@ -129,6 +191,20 @@ static int hex_to_bytes(
 
 static void remove_newline(char *text) {
     text[strcspn(text, "\r\n")] = '\0';
+}
+
+static int is_timestamp_fresh(uint64_t packet_timestamp) {
+    uint64_t now = (uint64_t)time(NULL);
+
+    if (packet_timestamp + FRESHNESS_WINDOW_SECONDS < now) {
+        return 0;
+    }
+
+    if (packet_timestamp > now + FRESHNESS_WINDOW_SECONDS) {
+        return 0;
+    }
+
+    return 1;
 }
 
 static int load_trusted_robots(
@@ -238,6 +314,300 @@ static int is_duplicate_robot(
             return 1;
         }
     }
+
+    return 0;
+}
+
+static int perform_key_exchange(
+    SOCKET data_sock,
+    const struct sockaddr_in *robot_data_addr,
+    const DiscoveredRobot *robot,
+    SecureSession *session
+) {
+    memset(session, 0, sizeof(*session));
+
+    crypto_kx_keypair(
+        session->client_kx_public_key,
+        session->client_kx_private_key
+    );
+
+    uint64_t kx_challenge;
+    randombytes_buf(&kx_challenge, sizeof(kx_challenge));
+
+    KeyExchangeRequestPacket request;
+    memset(&request, 0, sizeof(request));
+
+    strncpy(request.magic, KX_REQUEST_MAGIC, MAGIC_SIZE);
+    strncpy(request.device_id, robot->device_id, DEVICE_ID_SIZE - 1);
+    strncpy(request.serial_number, robot->serial_number, SERIAL_SIZE - 1);
+    memcpy(
+        request.client_kx_public_key,
+        session->client_kx_public_key,
+        crypto_kx_PUBLICKEYBYTES
+    );
+    request.challenge_nonce = kx_challenge;
+    request.timestamp = (uint64_t)time(NULL);
+
+    int sent = sendto(
+        data_sock,
+        (const char *)&request,
+        sizeof(request),
+        0,
+        (const struct sockaddr *)robot_data_addr,
+        sizeof(*robot_data_addr)
+    );
+
+    if (sent == SOCKET_ERROR) {
+        printf("Key exchange request failed: %d\n", WSAGetLastError());
+        return -1;
+    }
+
+    KeyExchangeResponsePacket response;
+    struct sockaddr_in sender_addr;
+    int sender_len = sizeof(sender_addr);
+
+    int received = recvfrom(
+        data_sock,
+        (char *)&response,
+        sizeof(response),
+        0,
+        (struct sockaddr *)&sender_addr,
+        &sender_len
+    );
+
+    if (received == SOCKET_ERROR) {
+        printf("No key exchange response received\n");
+        return -1;
+    }
+
+    if (received != sizeof(KeyExchangeResponsePacket)) {
+        printf("Invalid key exchange response size\n");
+        return -1;
+    }
+
+    if (strncmp(response.body.magic, KX_RESPONSE_MAGIC, MAGIC_SIZE) != 0) {
+        printf("Invalid key exchange response magic\n");
+        return -1;
+    }
+
+    if (strncmp(response.body.device_id, robot->device_id, DEVICE_ID_SIZE) != 0 ||
+        strncmp(response.body.serial_number, robot->serial_number, SERIAL_SIZE) != 0) {
+        printf("Key exchange identity mismatch\n");
+        return -1;
+    }
+
+    if (response.body.challenge_nonce != kx_challenge) {
+        printf("Key exchange challenge mismatch\n");
+        return -1;
+    }
+
+    if (!is_timestamp_fresh(response.body.timestamp)) {
+        printf("Old key exchange response ignored\n");
+        return -1;
+    }
+
+    if (sodium_memcmp(
+            response.body.client_kx_public_key,
+            session->client_kx_public_key,
+            crypto_kx_PUBLICKEYBYTES
+        ) != 0) {
+        printf("Key exchange client public key echo mismatch\n");
+        return -1;
+    }
+
+    int verify_result = crypto_sign_verify_detached(
+        response.signature,
+        (unsigned char *)&response.body,
+        sizeof(KeyExchangeResponseBody),
+        robot->public_key
+    );
+
+    if (verify_result != 0) {
+        printf("Invalid signed key exchange response\n");
+        return -1;
+    }
+
+    memcpy(
+        session->server_kx_public_key,
+        response.body.server_kx_public_key,
+        crypto_kx_PUBLICKEYBYTES
+    );
+
+    if (crypto_kx_client_session_keys(
+            session->rx_key,
+            session->tx_key,
+            session->client_kx_public_key,
+            session->client_kx_private_key,
+            session->server_kx_public_key
+        ) != 0) {
+        printf("Failed to derive client session keys\n");
+        return -1;
+    }
+
+    session->next_request_sequence = 1;
+    session->last_response_sequence = 0;
+
+    printf("Secure encrypted session established.\n");
+    return 0;
+}
+
+static int send_encrypted_data_request(
+    SOCKET data_sock,
+    const struct sockaddr_in *robot_data_addr,
+    const DiscoveredRobot *robot,
+    SecureSession *session,
+    uint64_t *challenge_out
+) {
+    EncryptedDataRequestBody body;
+    memset(&body, 0, sizeof(body));
+
+    randombytes_buf(challenge_out, sizeof(*challenge_out));
+
+    strncpy(body.magic, DATA_REQUEST_MAGIC, MAGIC_SIZE);
+    strncpy(body.device_id, robot->device_id, DEVICE_ID_SIZE - 1);
+    strncpy(body.serial_number, robot->serial_number, SERIAL_SIZE - 1);
+    body.request_sequence = session->next_request_sequence++;
+    body.challenge_nonce = *challenge_out;
+    body.timestamp = (uint64_t)time(NULL);
+
+    EncryptedDataRequestPacket packet;
+    unsigned long long encrypted_len = 0;
+    memset(&packet, 0, sizeof(packet));
+
+    strncpy(packet.magic, ENCRYPTED_DATA_REQUEST_MAGIC, MAGIC_SIZE);
+    randombytes_buf(packet.nonce, sizeof(packet.nonce));
+
+    if (crypto_aead_xchacha20poly1305_ietf_encrypt(
+            packet.ciphertext,
+            &encrypted_len,
+            (unsigned char *)&body,
+            sizeof(body),
+            NULL,
+            0,
+            NULL,
+            packet.nonce,
+            session->tx_key
+        ) != 0) {
+        printf("Failed to encrypt data request\n");
+        return -1;
+    }
+
+    if (encrypted_len != sizeof(packet.ciphertext)) {
+        printf("Unexpected encrypted request length\n");
+        return -1;
+    }
+
+    int sent = sendto(
+        data_sock,
+        (const char *)&packet,
+        sizeof(packet),
+        0,
+        (const struct sockaddr *)robot_data_addr,
+        sizeof(*robot_data_addr)
+    );
+
+    if (sent == SOCKET_ERROR) {
+        printf("Encrypted data request failed: %d\n", WSAGetLastError());
+        return -1;
+    }
+
+    return 0;
+}
+
+static int receive_encrypted_data_response(
+    SOCKET data_sock,
+    const DiscoveredRobot *robot,
+    SecureSession *session,
+    uint64_t expected_challenge
+) {
+    EncryptedDataResponsePacket packet;
+    struct sockaddr_in sender_addr;
+    int sender_len = sizeof(sender_addr);
+
+    int received = recvfrom(
+        data_sock,
+        (char *)&packet,
+        sizeof(packet),
+        0,
+        (struct sockaddr *)&sender_addr,
+        &sender_len
+    );
+
+    if (received == SOCKET_ERROR) {
+        printf("No encrypted data response received\n");
+        return -1;
+    }
+
+    if (received != sizeof(EncryptedDataResponsePacket)) {
+        printf("Invalid encrypted response size ignored\n");
+        return -1;
+    }
+
+    if (strncmp(packet.magic, ENCRYPTED_DATA_RESPONSE_MAGIC, MAGIC_SIZE) != 0) {
+        printf("Invalid encrypted response magic ignored\n");
+        return -1;
+    }
+
+    EncryptedDataResponseBody body;
+    unsigned long long decrypted_len = 0;
+
+    if (crypto_aead_xchacha20poly1305_ietf_decrypt(
+            (unsigned char *)&body,
+            &decrypted_len,
+            NULL,
+            packet.ciphertext,
+            sizeof(packet.ciphertext),
+            NULL,
+            0,
+            packet.nonce,
+            session->rx_key
+        ) != 0) {
+        printf("Encrypted response authentication failed\n");
+        return -1;
+    }
+
+    if (decrypted_len != sizeof(EncryptedDataResponseBody)) {
+        printf("Invalid encrypted response plaintext size\n");
+        return -1;
+    }
+
+    if (strncmp(body.magic, DATA_RESPONSE_MAGIC, MAGIC_SIZE) != 0) {
+        printf("Invalid encrypted response plaintext magic\n");
+        return -1;
+    }
+
+    if (strncmp(body.device_id, robot->device_id, DEVICE_ID_SIZE) != 0 ||
+        strncmp(body.serial_number, robot->serial_number, SERIAL_SIZE) != 0) {
+        printf("Encrypted response identity mismatch ignored\n");
+        return -1;
+    }
+
+    if (body.challenge_nonce != expected_challenge) {
+        printf("Encrypted response challenge mismatch ignored\n");
+        return -1;
+    }
+
+    if (!is_timestamp_fresh(body.timestamp)) {
+        printf("Old encrypted response timestamp ignored\n");
+        return -1;
+    }
+
+    if (body.response_sequence <= session->last_response_sequence) {
+        printf("Old or replayed encrypted response ignored\n");
+        return -1;
+    }
+
+    session->last_response_sequence = body.response_sequence;
+
+    printf("Valid encrypted robot data received\n");
+    printf("Device ID     : %s\n", body.device_id);
+    printf("Serial Number : %s\n", body.serial_number);
+    printf("Response Seq  : %u\n", body.response_sequence);
+    printf("Counter       : %d\n", body.counter);
+    printf("Battery       : %.2f\n", body.battery_level);
+    printf("Temperature   : %.2f\n", body.temperature);
+    printf("Message       : %s\n", body.message);
+    printf("------------------------------------------\n");
 
     return 0;
 }
@@ -369,9 +739,7 @@ int main() {
             continue;
         }
 
-        uint64_t now = (uint64_t)time(NULL);
-
-        if (response.body.timestamp + 10 < now) {
+        if (!is_timestamp_fresh(response.body.timestamp)) {
             printf("Old discovery response ignored\n");
             continue;
         }
@@ -552,120 +920,46 @@ int main() {
         return 1;
     }
 
-    uint32_t last_sequence_number = 0;
+    SecureSession session;
+
+    if (perform_key_exchange(
+            data_sock,
+            &robot_data_addr,
+            &selected_robot,
+            &session
+        ) != 0) {
+        printf("Secure session setup failed.\n");
+        closesocket(data_sock);
+        closesocket(discovery_sock);
+        WSACleanup();
+        return 1;
+    }
 
     while (1) {
-        uint64_t data_challenge;
-        randombytes_buf(&data_challenge, sizeof(data_challenge));
+        uint64_t data_challenge = 0;
 
-        DataRequestPacket request;
-        memset(&request, 0, sizeof(request));
+        if (send_encrypted_data_request(
+                data_sock,
+                &robot_data_addr,
+                &selected_robot,
+                &session,
+                &data_challenge
+            ) != 0) {
+            Sleep(1000);
+            continue;
+        }
 
-        strncpy(request.magic, DATA_REQUEST_MAGIC, MAGIC_SIZE);
-        request.challenge_nonce = data_challenge;
-        request.timestamp = (uint64_t)time(NULL);
-
-        int data_sent = sendto(
+        receive_encrypted_data_response(
             data_sock,
-            (const char *)&request,
-            sizeof(request),
-            0,
-            (struct sockaddr *)&robot_data_addr,
-            sizeof(robot_data_addr)
+            &selected_robot,
+            &session,
+            data_challenge
         );
-
-        if (data_sent == SOCKET_ERROR) {
-            printf("Data request failed: %d\n", WSAGetLastError());
-            Sleep(1000);
-            continue;
-        }
-
-        DataResponsePacket response;
-        struct sockaddr_in sender_addr;
-        int sender_len = sizeof(sender_addr);
-
-        int received = recvfrom(
-            data_sock,
-            (char *)&response,
-            sizeof(response),
-            0,
-            (struct sockaddr *)&sender_addr,
-            &sender_len
-        );
-
-        if (received == SOCKET_ERROR) {
-            printf("No data response received\n");
-            Sleep(1000);
-            continue;
-        }
-
-        if (received != sizeof(DataResponsePacket)) {
-            printf("Invalid data response size ignored\n");
-            Sleep(1000);
-            continue;
-        }
-
-        if (strncmp(response.body.magic, DATA_RESPONSE_MAGIC, MAGIC_SIZE) != 0) {
-            printf("Invalid data response magic ignored\n");
-            Sleep(1000);
-            continue;
-        }
-
-        if (strncmp(response.body.device_id, selected_robot.device_id, DEVICE_ID_SIZE) != 0 ||
-            strncmp(response.body.serial_number, selected_robot.serial_number, SERIAL_SIZE) != 0) {
-            printf("Robot identity mismatch ignored\n");
-            Sleep(1000);
-            continue;
-        }
-
-        if (response.body.challenge_nonce != data_challenge) {
-            printf("Data challenge mismatch ignored\n");
-            Sleep(1000);
-            continue;
-        }
-
-        int verify_result = crypto_sign_verify_detached(
-            response.signature,
-            (unsigned char *)&response.body,
-            sizeof(DataResponseBody),
-            selected_robot.public_key
-        );
-
-        if (verify_result != 0) {
-            printf("Invalid data signature ignored\n");
-            Sleep(1000);
-            continue;
-        }
-
-        if (response.body.sequence_number <= last_sequence_number) {
-            printf("Old or replayed data packet ignored\n");
-            Sleep(1000);
-            continue;
-        }
-
-        last_sequence_number = response.body.sequence_number;
-
-        uint64_t now = (uint64_t)time(NULL);
-
-        if (response.body.timestamp + 10 < now) {
-            printf("Old data timestamp ignored\n");
-            Sleep(1000);
-            continue;
-        }
-
-        printf("Valid signed robot data received\n");
-        printf("Device ID     : %s\n", response.body.device_id);
-        printf("Serial Number : %s\n", response.body.serial_number);
-        printf("Sequence No   : %u\n", response.body.sequence_number);
-        printf("Counter       : %d\n", response.body.counter);
-        printf("Battery       : %.2f\n", response.body.battery_level);
-        printf("Temperature   : %.2f\n", response.body.temperature);
-        printf("Message       : %s\n", response.body.message);
-        printf("------------------------------------------\n");
 
         Sleep(1000);
     }
 
+    sodium_memzero(&session, sizeof(session));
     closesocket(data_sock);
     closesocket(discovery_sock);
     WSACleanup();
