@@ -763,6 +763,13 @@ int main() {
             response.body.serial_number
         );
 
+        /*
+         * Trust status is a label for the discovered robot, not a filter.
+         *
+         * - Known robot + same public key: show as TRUSTED.
+         * - Known robot + changed public key: reject as possible spoofing.
+         * - Unknown robot: still show as NEW / UNPAIRED so the user can pair it.
+         */
         int trusted = 0;
 
         if (trusted_index >= 0) {
@@ -779,6 +786,8 @@ int main() {
                 );
                 continue;
             }
+        } else {
+            trusted = 0;
         }
 
         if (is_duplicate_robot(
