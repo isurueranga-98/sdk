@@ -15,6 +15,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <iphlpapi.h>
 #include <sodium.h>
 
 #ifdef _MSC_VER
@@ -33,6 +34,8 @@
 
 #define MAX_ROBOTS 20
 #define MAX_TRUSTED_ROBOTS 50
+#define DISCOVERY_SEND_ROUNDS 3
+#define DISCOVERY_ROUND_DELAY_MS 250
 
 #define DISCOVERY_REQUEST_MAGIC "RDISCOV"
 #define DISCOVERY_RESPONSE_MAGIC "RRESPON"
@@ -359,6 +362,153 @@ static int is_duplicate_robot(
     }
 
     return 0;
+}
+
+static int send_discovery_to_address(
+    SOCKET discovery_sock,
+    const DiscoveryRequestPacket *request,
+    uint32_t address
+) {
+    struct sockaddr_in broadcast_addr;
+    memset(&broadcast_addr, 0, sizeof(broadcast_addr));
+
+    broadcast_addr.sin_family = AF_INET;
+    broadcast_addr.sin_port = htons(DISCOVERY_PORT);
+    broadcast_addr.sin_addr.s_addr = address;
+
+    int sent = sendto(
+        discovery_sock,
+        (const char *)request,
+        sizeof(*request),
+        0,
+        (struct sockaddr *)&broadcast_addr,
+        sizeof(broadcast_addr)
+    );
+
+    if (sent == SOCKET_ERROR) {
+        return -1;
+    }
+
+    return 0;
+}
+
+static int send_adapter_discovery_requests(
+    SOCKET discovery_sock,
+    const DiscoveryRequestPacket *request
+) {
+    ULONG buffer_size = 15 * 1024;
+    IP_ADAPTER_ADDRESSES *adapters = NULL;
+    DWORD flags = GAA_FLAG_SKIP_ANYCAST |
+                  GAA_FLAG_SKIP_MULTICAST |
+                  GAA_FLAG_SKIP_DNS_SERVER;
+    DWORD result;
+    int sent_count = 0;
+
+    adapters = (IP_ADAPTER_ADDRESSES *)malloc(buffer_size);
+
+    if (adapters == NULL) {
+        return 0;
+    }
+
+    result = GetAdaptersAddresses(
+        AF_INET,
+        flags,
+        NULL,
+        adapters,
+        &buffer_size
+    );
+
+    if (result == ERROR_BUFFER_OVERFLOW) {
+        IP_ADAPTER_ADDRESSES *resized =
+            (IP_ADAPTER_ADDRESSES *)realloc(adapters, buffer_size);
+
+        if (resized == NULL) {
+            free(adapters);
+            return 0;
+        }
+
+        adapters = resized;
+        result = GetAdaptersAddresses(
+            AF_INET,
+            flags,
+            NULL,
+            adapters,
+            &buffer_size
+        );
+    }
+
+    if (result != NO_ERROR) {
+        free(adapters);
+        return 0;
+    }
+
+    for (IP_ADAPTER_ADDRESSES *adapter = adapters;
+         adapter != NULL;
+         adapter = adapter->Next) {
+        if (adapter->OperStatus != IfOperStatusUp ||
+            adapter->IfType == IF_TYPE_SOFTWARE_LOOPBACK ||
+            adapter->IfType == IF_TYPE_TUNNEL) {
+            continue;
+        }
+
+        for (IP_ADAPTER_UNICAST_ADDRESS *unicast = adapter->FirstUnicastAddress;
+             unicast != NULL;
+             unicast = unicast->Next) {
+            struct sockaddr_in *addr =
+                (struct sockaddr_in *)unicast->Address.lpSockaddr;
+
+            if (addr == NULL || addr->sin_family != AF_INET) {
+                continue;
+            }
+
+            ULONG prefix = unicast->OnLinkPrefixLength;
+
+            if (prefix > 30) {
+                continue;
+            }
+
+            uint32_t ip_host = ntohl(addr->sin_addr.s_addr);
+            uint32_t mask = prefix == 0 ? 0 : (0xffffffffUL << (32 - prefix));
+            uint32_t broadcast_host = ip_host | ~mask;
+            uint32_t broadcast_address = htonl(broadcast_host);
+
+            if (send_discovery_to_address(
+                    discovery_sock,
+                    request,
+                    broadcast_address
+                ) == 0) {
+                sent_count++;
+            }
+        }
+    }
+
+    free(adapters);
+    return sent_count;
+}
+
+static int send_discovery_requests(
+    SOCKET discovery_sock,
+    const DiscoveryRequestPacket *request
+) {
+    int sent_count = 0;
+
+    for (int round = 0; round < DISCOVERY_SEND_ROUNDS; round++) {
+        if (send_discovery_to_address(
+                discovery_sock,
+                request,
+                INADDR_BROADCAST
+            ) == 0) {
+            sent_count++;
+        }
+
+        sent_count += send_adapter_discovery_requests(discovery_sock, request);
+
+        if (round + 1 < DISCOVERY_SEND_ROUNDS) {
+            Sleep(DISCOVERY_ROUND_DELAY_MS);
+        }
+    }
+
+    return sent_count;
 }
 
 static int perform_key_exchange(
@@ -709,13 +859,6 @@ int main() {
         sizeof(timeout_ms)
     );
 
-    struct sockaddr_in broadcast_addr;
-    memset(&broadcast_addr, 0, sizeof(broadcast_addr));
-
-    broadcast_addr.sin_family = AF_INET;
-    broadcast_addr.sin_port = htons(DISCOVERY_PORT);
-    broadcast_addr.sin_addr.s_addr = INADDR_BROADCAST;
-
     uint64_t discovery_challenge;
     randombytes_buf(&discovery_challenge, sizeof(discovery_challenge));
 
@@ -728,16 +871,12 @@ int main() {
 
     printf("\nSending robot discovery broadcast...\n");
 
-    int sent = sendto(
+    int sent = send_discovery_requests(
         discovery_sock,
-        (const char *)&discovery_request,
-        sizeof(discovery_request),
-        0,
-        (struct sockaddr *)&broadcast_addr,
-        sizeof(broadcast_addr)
+        &discovery_request
     );
 
-    if (sent == SOCKET_ERROR) {
+    if (sent == 0) {
         printf("Discovery send failed: %d\n", WSAGetLastError());
         closesocket(discovery_sock);
         WSACleanup();
