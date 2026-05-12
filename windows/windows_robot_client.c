@@ -384,14 +384,14 @@ static int is_timestamp_fresh(uint64_t packet_timestamp) {
     return 1;
 }
 
-static int has_onex_extension(const char *path) {
+static int has_onnx_extension(const char *path) {
     size_t length = strlen(path);
 
     if (length < 5) {
         return 0;
     }
 
-    return _stricmp(path + length - 5, ".onex") == 0;
+    return _stricmp(path + length - 5, ".onnx") == 0;
 }
 
 static const char *base_name_from_path(const char *path) {
@@ -423,7 +423,7 @@ static int sanitize_filename(const char *file_name) {
         return 0;
     }
 
-    return has_onex_extension(file_name);
+    return has_onnx_extension(file_name);
 }
 
 static int get_file_size(FILE *file, uint64_t *size_out) {
@@ -1508,7 +1508,7 @@ static int handle_file_complete(
     return -1;
 }
 
-static int transfer_onex_file(
+static int transfer_onnx_file(
     SOCKET data_sock,
     const struct sockaddr_in *robot_data_addr,
     SecureSession *session,
@@ -1521,15 +1521,15 @@ static int transfer_onex_file(
     uint64_t transfer_id = 0;
     unsigned char file_hash[crypto_hash_sha256_BYTES];
 
-    if (!has_onex_extension(file_path) || !sanitize_filename(base_name)) {
-        printf("Only safe .onex file names are allowed\n");
+    if (!has_onnx_extension(file_path) || !sanitize_filename(base_name)) {
+        printf("Only safe .onnx file names are allowed\n");
         return -1;
     }
 
     copy_text(file_name, sizeof(file_name), base_name);
 
     if (compute_file_sha256(file_path, file_hash, &file_size) != 0) {
-        printf("Failed to open/hash .onex file\n");
+        printf("Failed to open/hash .onnx file\n");
         return -1;
     }
 
@@ -1542,7 +1542,7 @@ static int transfer_onex_file(
     randombytes_buf(&transfer_id, sizeof(transfer_id));
 
     printf(
-        "Sending .onex file: %s | size=%llu | chunks=%u\n",
+        "Sending .onnx file: %s | size=%llu | chunks=%u\n",
         file_name,
         (unsigned long long)file_size,
         total_chunks
@@ -1923,11 +1923,11 @@ int main() {
     while ((ch = getchar()) != '\n' && ch != EOF) {
     }
 
-    char onex_path[512];
+    char onnx_path[512];
 
-    printf("Enter .onex file path to send: ");
+    printf("Enter .onnx file path to send: ");
 
-    if (fgets(onex_path, sizeof(onex_path), stdin) == NULL) {
+    if (fgets(onnx_path, sizeof(onnx_path), stdin) == NULL) {
         printf("No file path entered.\n");
         closesocket(data_sock);
         closesocket(discovery_sock);
@@ -1935,22 +1935,22 @@ int main() {
         return 1;
     }
 
-    remove_newline(onex_path);
+    remove_newline(onnx_path);
 
-    if (transfer_onex_file(
+    if (transfer_onnx_file(
             data_sock,
             &robot_data_addr,
             &session,
-            onex_path
+            onnx_path
         ) != 0) {
-        printf("Secure .onex file transfer failed.\n");
+        printf("Secure .onnx file transfer failed.\n");
         closesocket(data_sock);
         closesocket(discovery_sock);
         WSACleanup();
         return 1;
     }
 
-    printf("Secure .onex file transfer finished. Starting shared-memory data polling.\n");
+    printf("Secure .onnx file transfer finished. Starting shared-memory data polling.\n");
 
     setsockopt(
         data_sock,

@@ -347,14 +347,14 @@ static void copy_text(char *destination, size_t destination_size, const char *so
     snprintf(destination, destination_size, "%s", source);
 }
 
-static int has_onex_extension(const char *file_name) {
+static int has_onnx_extension(const char *file_name) {
     size_t length = strlen(file_name);
 
     if (length < 5) {
         return 0;
     }
 
-    return strcmp(file_name + length - 5, ".onex") == 0;
+    return strcmp(file_name + length - 5, ".onnx") == 0;
 }
 
 static int sanitize_filename(const char *file_name) {
@@ -370,7 +370,7 @@ static int sanitize_filename(const char *file_name) {
         return 0;
     }
 
-    return has_onex_extension(file_name);
+    return has_onnx_extension(file_name);
 }
 
 static int create_downloads_directory(void) {
