@@ -12,7 +12,9 @@
 #include <unistd.h>
 #include <time.h>
 #include <fcntl.h>
+#include <errno.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <arpa/inet.h>
 #include <sys/select.h>
 #include <sodium.h>
@@ -31,6 +33,22 @@
 #define IP_SIZE 32
 #define MESSAGE_SIZE 256
 
+#define CHUNK_SIZE 1200
+#define WINDOW_SIZE 16
+#define ACK_TIMEOUT_MS 500
+#define MAX_RETRIES 20
+#define MAX_FILE_SIZE (100ULL * 1024ULL * 1024ULL)
+#define DOWNLOAD_DIR "downloads"
+#define FILE_NAME_SIZE 128
+#define FILE_PATH_SIZE 256
+#define FILE_MESSAGE_SIZE 128
+#define ACK_MESSAGE_SIZE 64
+#define MAX_MISSING_LIST 64
+#define FILE_PACKET_MAGIC "RFILE"
+#define MAX_FILE_PLAINTEXT_SIZE 1400
+#define MAX_FILE_CIPHERTEXT_SIZE \
+    (MAX_FILE_PLAINTEXT_SIZE + crypto_aead_xchacha20poly1305_ietf_ABYTES)
+
 #define DISCOVERY_REQUEST_MAGIC "RDISCOV"
 #define DISCOVERY_RESPONSE_MAGIC "RRESPON"
 #define KX_REQUEST_MAGIC "RKXREQ"
@@ -41,6 +59,18 @@
 #define DATA_RESPONSE_MAGIC "EDATAR"
 
 #define FRESHNESS_WINDOW_SECONDS 10
+
+enum {
+    PACKET_TYPE_FILE_META = 1,
+    PACKET_TYPE_FILE_META_ACK = 2,
+    PACKET_TYPE_FILE_CHUNK = 3,
+    PACKET_TYPE_FILE_CHUNK_ACK = 4,
+    PACKET_TYPE_FILE_STATUS_REQUEST = 5,
+    PACKET_TYPE_FILE_STATUS_RESPONSE = 6,
+    PACKET_TYPE_FILE_COMPLETE_REQUEST = 7,
+    PACKET_TYPE_FILE_COMPLETE_RESPONSE = 8,
+    PACKET_TYPE_FILE_TRANSFER_FAILED = 9
+};
 
 #pragma pack(push, 1)
 
@@ -137,6 +167,109 @@ typedef struct {
     ];
 } EncryptedDataResponsePacket;
 
+typedef struct {
+    char magic[MAGIC_SIZE];
+    uint32_t packet_type;
+    uint64_t transfer_id;
+    uint32_t sequence_number;
+    uint64_t timestamp;
+    char file_name[FILE_NAME_SIZE];
+    uint64_t file_size;
+    uint32_t chunk_size;
+    uint32_t total_chunks;
+    unsigned char file_sha256[crypto_hash_sha256_BYTES];
+} FileMetaPlain;
+
+typedef struct {
+    char magic[MAGIC_SIZE];
+    uint32_t packet_type;
+    uint64_t transfer_id;
+    uint32_t sequence_number;
+    uint64_t timestamp;
+    int32_t accepted;
+    char message[FILE_MESSAGE_SIZE];
+} FileMetaAckPlain;
+
+typedef struct {
+    char magic[MAGIC_SIZE];
+    uint32_t packet_type;
+    uint64_t transfer_id;
+    uint32_t sequence_number;
+    uint64_t timestamp;
+    uint32_t chunk_index;
+    uint32_t chunk_size;
+    uint64_t offset;
+    unsigned char data[CHUNK_SIZE];
+} FileChunkPlain;
+
+typedef struct {
+    char magic[MAGIC_SIZE];
+    uint32_t packet_type;
+    uint64_t transfer_id;
+    uint32_t sequence_number;
+    uint64_t timestamp;
+    uint32_t chunk_index;
+    int32_t status;
+    char message[ACK_MESSAGE_SIZE];
+} FileChunkAckPlain;
+
+typedef struct {
+    char magic[MAGIC_SIZE];
+    uint32_t packet_type;
+    uint64_t transfer_id;
+    uint32_t sequence_number;
+    uint64_t timestamp;
+} FileStatusRequestPlain;
+
+typedef struct {
+    char magic[MAGIC_SIZE];
+    uint32_t packet_type;
+    uint64_t transfer_id;
+    uint32_t sequence_number;
+    uint64_t timestamp;
+    uint32_t total_chunks;
+    uint32_t received_chunks;
+    uint32_t missing_count;
+    uint32_t missing_indices[MAX_MISSING_LIST];
+} FileStatusResponsePlain;
+
+typedef struct {
+    char magic[MAGIC_SIZE];
+    uint32_t packet_type;
+    uint64_t transfer_id;
+    uint32_t sequence_number;
+    uint64_t timestamp;
+} FileCompleteRequestPlain;
+
+typedef struct {
+    char magic[MAGIC_SIZE];
+    uint32_t packet_type;
+    uint64_t transfer_id;
+    uint32_t sequence_number;
+    uint64_t timestamp;
+    int32_t success;
+    char final_file_path[FILE_PATH_SIZE];
+    unsigned char computed_sha256[crypto_hash_sha256_BYTES];
+    char message[FILE_MESSAGE_SIZE];
+} FileCompleteResponsePlain;
+
+typedef struct {
+    char magic[MAGIC_SIZE];
+    uint32_t packet_type;
+    uint64_t transfer_id;
+    uint32_t sequence_number;
+    uint64_t timestamp;
+    int32_t error_code;
+    char message[FILE_MESSAGE_SIZE];
+} FileTransferFailedPlain;
+
+typedef struct {
+    char magic[MAGIC_SIZE];
+    unsigned char nonce[crypto_aead_xchacha20poly1305_ietf_NPUBBYTES];
+    uint32_t ciphertext_len;
+    unsigned char ciphertext[MAX_FILE_CIPHERTEXT_SIZE];
+} EncryptedFilePacket;
+
 #pragma pack(pop)
 
 typedef struct {
@@ -157,6 +290,22 @@ typedef struct {
     uint32_t last_request_sequence;
     uint32_t next_response_sequence;
 } SecureSession;
+
+typedef struct {
+    int active;
+    int complete;
+    uint64_t transfer_id;
+    char file_name[FILE_NAME_SIZE];
+    char part_path[FILE_PATH_SIZE];
+    char final_path[FILE_PATH_SIZE];
+    uint64_t file_size;
+    uint32_t chunk_size;
+    uint32_t total_chunks;
+    uint32_t received_chunks;
+    unsigned char expected_sha256[crypto_hash_sha256_BYTES];
+    unsigned char *received_bitmap;
+    FILE *file;
+} FileTransferState;
 
 static int hex_to_bytes(const char *hex, unsigned char *output, size_t output_size) {
     size_t hex_len = strlen(hex);
@@ -188,6 +337,201 @@ static int is_timestamp_fresh(uint64_t packet_timestamp) {
     }
 
     return 1;
+}
+
+static void copy_text(char *destination, size_t destination_size, const char *source) {
+    if (destination_size == 0) {
+        return;
+    }
+
+    snprintf(destination, destination_size, "%s", source);
+}
+
+static int has_onex_extension(const char *file_name) {
+    size_t length = strlen(file_name);
+
+    if (length < 5) {
+        return 0;
+    }
+
+    return strcmp(file_name + length - 5, ".onex") == 0;
+}
+
+static int sanitize_filename(const char *file_name) {
+    if (file_name == NULL || file_name[0] == '\0') {
+        return 0;
+    }
+
+    if (strstr(file_name, "../") != NULL ||
+        strstr(file_name, "..\\") != NULL ||
+        strchr(file_name, '/') != NULL ||
+        strchr(file_name, '\\') != NULL ||
+        strchr(file_name, ':') != NULL) {
+        return 0;
+    }
+
+    return has_onex_extension(file_name);
+}
+
+static int create_downloads_directory(void) {
+    if (mkdir(DOWNLOAD_DIR, 0700) == 0) {
+        return 0;
+    }
+
+    if (errno == EEXIST) {
+        struct stat st;
+
+        if (stat(DOWNLOAD_DIR, &st) == 0 && S_ISDIR(st.st_mode)) {
+            return 0;
+        }
+    }
+
+    return -1;
+}
+
+static int compute_file_sha256(const char *path, unsigned char hash[crypto_hash_sha256_BYTES]) {
+    FILE *file = fopen(path, "rb");
+
+    if (file == NULL) {
+        return -1;
+    }
+
+    crypto_hash_sha256_state state;
+    unsigned char buffer[4096];
+    size_t read_count;
+
+    crypto_hash_sha256_init(&state);
+
+    while ((read_count = fread(buffer, 1, sizeof(buffer), file)) > 0) {
+        crypto_hash_sha256_update(&state, buffer, read_count);
+    }
+
+    if (ferror(file)) {
+        fclose(file);
+        return -1;
+    }
+
+    crypto_hash_sha256_final(&state, hash);
+    fclose(file);
+    return 0;
+}
+
+static void cleanup_file_transfer(FileTransferState *transfer) {
+    if (transfer->file != NULL) {
+        fclose(transfer->file);
+        transfer->file = NULL;
+    }
+
+    free(transfer->received_bitmap);
+    transfer->received_bitmap = NULL;
+    memset(transfer, 0, sizeof(*transfer));
+}
+
+static int encrypt_packet(
+    const SecureSession *session,
+    const void *plain,
+    size_t plain_len,
+    EncryptedFilePacket *packet,
+    size_t *packet_len
+) {
+    unsigned long long encrypted_len = 0;
+
+    if (plain_len > MAX_FILE_PLAINTEXT_SIZE) {
+        return -1;
+    }
+
+    memset(packet, 0, sizeof(*packet));
+    copy_text(packet->magic, MAGIC_SIZE, FILE_PACKET_MAGIC);
+    randombytes_buf(packet->nonce, sizeof(packet->nonce));
+
+    if (crypto_aead_xchacha20poly1305_ietf_encrypt(
+            packet->ciphertext,
+            &encrypted_len,
+            plain,
+            plain_len,
+            NULL,
+            0,
+            NULL,
+            packet->nonce,
+            session->tx_key
+        ) != 0) {
+        return -1;
+    }
+
+    packet->ciphertext_len = (uint32_t)encrypted_len;
+    *packet_len = MAGIC_SIZE + sizeof(packet->nonce) +
+                  sizeof(packet->ciphertext_len) + packet->ciphertext_len;
+    return 0;
+}
+
+static int decrypt_packet(
+    const SecureSession *session,
+    const EncryptedFilePacket *packet,
+    size_t packet_len,
+    void *plain,
+    size_t plain_capacity,
+    size_t *plain_len
+) {
+    unsigned long long decrypted_len = 0;
+    size_t header_len = MAGIC_SIZE + sizeof(packet->nonce) +
+                        sizeof(packet->ciphertext_len);
+
+    if (packet_len < header_len ||
+        strncmp(packet->magic, FILE_PACKET_MAGIC, MAGIC_SIZE) != 0 ||
+        packet->ciphertext_len > MAX_FILE_CIPHERTEXT_SIZE ||
+        packet_len != header_len + packet->ciphertext_len) {
+        return -1;
+    }
+
+    if (crypto_aead_xchacha20poly1305_ietf_decrypt(
+            plain,
+            &decrypted_len,
+            NULL,
+            packet->ciphertext,
+            packet->ciphertext_len,
+            NULL,
+            0,
+            packet->nonce,
+            session->rx_key
+        ) != 0) {
+        return -1;
+    }
+
+    if (decrypted_len > plain_capacity) {
+        return -1;
+    }
+
+    *plain_len = (size_t)decrypted_len;
+    return 0;
+}
+
+static int send_encrypted_packet(
+    int data_sock,
+    const struct sockaddr_in *client_addr,
+    socklen_t client_len,
+    const SecureSession *session,
+    const void *plain,
+    size_t plain_len
+) {
+    EncryptedFilePacket packet;
+    size_t packet_len = 0;
+
+    if (encrypt_packet(session, plain, plain_len, &packet, &packet_len) != 0) {
+        return -1;
+    }
+
+    if (sendto(
+            data_sock,
+            &packet,
+            packet_len,
+            0,
+            (const struct sockaddr *)client_addr,
+            client_len
+        ) < 0) {
+        return -1;
+    }
+
+    return 0;
 }
 
 static int load_identity(RobotIdentity *identity) {
@@ -459,6 +803,558 @@ static void handle_key_exchange_request(
     printf("Secure session established for client %s\n", inet_ntoa(client_addr->sin_addr));
 }
 
+static void send_file_failed(
+    int data_sock,
+    const struct sockaddr_in *client_addr,
+    socklen_t client_len,
+    const SecureSession *session,
+    uint64_t transfer_id,
+    uint32_t sequence_number,
+    const char *message
+) {
+    FileTransferFailedPlain failed;
+    memset(&failed, 0, sizeof(failed));
+
+    copy_text(failed.magic, MAGIC_SIZE, FILE_PACKET_MAGIC);
+    failed.packet_type = PACKET_TYPE_FILE_TRANSFER_FAILED;
+    failed.transfer_id = transfer_id;
+    failed.sequence_number = sequence_number;
+    failed.timestamp = (uint64_t)time(NULL);
+    failed.error_code = -1;
+    copy_text(failed.message, sizeof(failed.message), message);
+
+    send_encrypted_packet(
+        data_sock,
+        client_addr,
+        client_len,
+        session,
+        &failed,
+        sizeof(failed)
+    );
+}
+
+static void send_meta_ack(
+    int data_sock,
+    const struct sockaddr_in *client_addr,
+    socklen_t client_len,
+    const SecureSession *session,
+    uint64_t transfer_id,
+    uint32_t sequence_number,
+    int accepted,
+    const char *message
+) {
+    FileMetaAckPlain ack;
+    memset(&ack, 0, sizeof(ack));
+
+    copy_text(ack.magic, MAGIC_SIZE, FILE_PACKET_MAGIC);
+    ack.packet_type = PACKET_TYPE_FILE_META_ACK;
+    ack.transfer_id = transfer_id;
+    ack.sequence_number = sequence_number;
+    ack.timestamp = (uint64_t)time(NULL);
+    ack.accepted = accepted;
+    copy_text(ack.message, sizeof(ack.message), message);
+
+    send_encrypted_packet(data_sock, client_addr, client_len, session, &ack, sizeof(ack));
+}
+
+static void send_chunk_ack(
+    int data_sock,
+    const struct sockaddr_in *client_addr,
+    socklen_t client_len,
+    const SecureSession *session,
+    uint64_t transfer_id,
+    uint32_t sequence_number,
+    uint32_t chunk_index,
+    int status,
+    const char *message
+) {
+    FileChunkAckPlain ack;
+    memset(&ack, 0, sizeof(ack));
+
+    copy_text(ack.magic, MAGIC_SIZE, FILE_PACKET_MAGIC);
+    ack.packet_type = PACKET_TYPE_FILE_CHUNK_ACK;
+    ack.transfer_id = transfer_id;
+    ack.sequence_number = sequence_number;
+    ack.timestamp = (uint64_t)time(NULL);
+    ack.chunk_index = chunk_index;
+    ack.status = status;
+    copy_text(ack.message, sizeof(ack.message), message);
+
+    send_encrypted_packet(data_sock, client_addr, client_len, session, &ack, sizeof(ack));
+}
+
+static int handle_file_metadata(
+    int data_sock,
+    const struct sockaddr_in *client_addr,
+    socklen_t client_len,
+    const SecureSession *session,
+    FileTransferState *transfer,
+    const FileMetaPlain *meta
+) {
+    if (strncmp(meta->magic, FILE_PACKET_MAGIC, MAGIC_SIZE) != 0 ||
+        meta->packet_type != PACKET_TYPE_FILE_META ||
+        !is_timestamp_fresh(meta->timestamp)) {
+        return -1;
+    }
+
+    if (!sanitize_filename(meta->file_name) ||
+        meta->file_size == 0 ||
+        meta->file_size > MAX_FILE_SIZE ||
+        meta->chunk_size == 0 ||
+        meta->chunk_size > CHUNK_SIZE ||
+        meta->total_chunks == 0 ||
+        meta->total_chunks !=
+            (uint32_t)((meta->file_size + meta->chunk_size - 1) / meta->chunk_size)) {
+        send_meta_ack(
+            data_sock,
+            client_addr,
+            client_len,
+            session,
+            meta->transfer_id,
+            meta->sequence_number,
+            0,
+            "Invalid file metadata"
+        );
+        return -1;
+    }
+
+    if (create_downloads_directory() != 0) {
+        send_meta_ack(
+            data_sock,
+            client_addr,
+            client_len,
+            session,
+            meta->transfer_id,
+            meta->sequence_number,
+            0,
+            "Cannot create downloads directory"
+        );
+        return -1;
+    }
+
+    FileTransferState new_transfer;
+    memset(&new_transfer, 0, sizeof(new_transfer));
+
+    new_transfer.received_bitmap = (unsigned char *)calloc(meta->total_chunks, 1);
+
+    if (new_transfer.received_bitmap == NULL) {
+        send_meta_ack(
+            data_sock,
+            client_addr,
+            client_len,
+            session,
+            meta->transfer_id,
+            meta->sequence_number,
+            0,
+            "Out of memory"
+        );
+        return -1;
+    }
+
+    copy_text(new_transfer.file_name, sizeof(new_transfer.file_name), meta->file_name);
+    snprintf(
+        new_transfer.part_path,
+        sizeof(new_transfer.part_path),
+        "%s/%llu_%s.part",
+        DOWNLOAD_DIR,
+        (unsigned long long)meta->transfer_id,
+        new_transfer.file_name
+    );
+    snprintf(
+        new_transfer.final_path,
+        sizeof(new_transfer.final_path),
+        "%s/%s",
+        DOWNLOAD_DIR,
+        new_transfer.file_name
+    );
+
+    if (access(new_transfer.final_path, F_OK) == 0) {
+        free(new_transfer.received_bitmap);
+        send_meta_ack(
+            data_sock,
+            client_addr,
+            client_len,
+            session,
+            meta->transfer_id,
+            meta->sequence_number,
+            0,
+            "Final file already exists"
+        );
+        return -1;
+    }
+
+    new_transfer.file = fopen(new_transfer.part_path, "w+b");
+
+    if (new_transfer.file == NULL) {
+        free(new_transfer.received_bitmap);
+        send_meta_ack(
+            data_sock,
+            client_addr,
+            client_len,
+            session,
+            meta->transfer_id,
+            meta->sequence_number,
+            0,
+            "Cannot create output file"
+        );
+        return -1;
+    }
+
+    cleanup_file_transfer(transfer);
+
+    new_transfer.active = 1;
+    new_transfer.transfer_id = meta->transfer_id;
+    new_transfer.file_size = meta->file_size;
+    new_transfer.chunk_size = meta->chunk_size;
+    new_transfer.total_chunks = meta->total_chunks;
+    memcpy(
+        new_transfer.expected_sha256,
+        meta->file_sha256,
+        crypto_hash_sha256_BYTES
+    );
+
+    *transfer = new_transfer;
+
+    send_meta_ack(
+        data_sock,
+        client_addr,
+        client_len,
+        session,
+        transfer->transfer_id,
+        meta->sequence_number,
+        1,
+        "Accepted"
+    );
+
+    printf(
+        "File transfer accepted | name=%s size=%llu chunks=%u\n",
+        transfer->file_name,
+        (unsigned long long)transfer->file_size,
+        transfer->total_chunks
+    );
+
+    return 0;
+}
+
+static void handle_file_chunk(
+    int data_sock,
+    const struct sockaddr_in *client_addr,
+    socklen_t client_len,
+    const SecureSession *session,
+    FileTransferState *transfer,
+    const FileChunkPlain *chunk
+) {
+    uint64_t expected_offset;
+    uint32_t expected_size;
+
+    if (!transfer->active ||
+        chunk->transfer_id != transfer->transfer_id ||
+        !is_timestamp_fresh(chunk->timestamp) ||
+        chunk->chunk_index >= transfer->total_chunks ||
+        chunk->chunk_size == 0 ||
+        chunk->chunk_size > transfer->chunk_size ||
+        chunk->chunk_size > CHUNK_SIZE) {
+        send_chunk_ack(
+            data_sock,
+            client_addr,
+            client_len,
+            session,
+            chunk->transfer_id,
+            chunk->sequence_number,
+            chunk->chunk_index,
+            0,
+            "Invalid chunk"
+        );
+        return;
+    }
+
+    expected_offset = (uint64_t)chunk->chunk_index * transfer->chunk_size;
+    expected_size = transfer->chunk_size;
+
+    if (chunk->chunk_index + 1 == transfer->total_chunks) {
+        expected_size = (uint32_t)(transfer->file_size - expected_offset);
+    }
+
+    if (chunk->offset != expected_offset || chunk->chunk_size != expected_size) {
+        send_chunk_ack(
+            data_sock,
+            client_addr,
+            client_len,
+            session,
+            chunk->transfer_id,
+            chunk->sequence_number,
+            chunk->chunk_index,
+            0,
+            "Chunk offset/size mismatch"
+        );
+        return;
+    }
+
+    if (transfer->received_bitmap[chunk->chunk_index]) {
+        send_chunk_ack(
+            data_sock,
+            client_addr,
+            client_len,
+            session,
+            transfer->transfer_id,
+            chunk->sequence_number,
+            chunk->chunk_index,
+            1,
+            "Duplicate ACK"
+        );
+        return;
+    }
+
+    if (fseek(transfer->file, (long)chunk->offset, SEEK_SET) != 0 ||
+        fwrite(chunk->data, 1, chunk->chunk_size, transfer->file) != chunk->chunk_size) {
+        send_chunk_ack(
+            data_sock,
+            client_addr,
+            client_len,
+            session,
+            transfer->transfer_id,
+            chunk->sequence_number,
+            chunk->chunk_index,
+            0,
+            "File write failed"
+        );
+        return;
+    }
+
+    transfer->received_bitmap[chunk->chunk_index] = 1;
+    transfer->received_chunks++;
+
+    send_chunk_ack(
+        data_sock,
+        client_addr,
+        client_len,
+        session,
+        transfer->transfer_id,
+        chunk->sequence_number,
+        chunk->chunk_index,
+        1,
+        "OK"
+    );
+}
+
+static void handle_file_status_request(
+    int data_sock,
+    const struct sockaddr_in *client_addr,
+    socklen_t client_len,
+    const SecureSession *session,
+    const FileTransferState *transfer,
+    const FileStatusRequestPlain *request
+) {
+    FileStatusResponsePlain response;
+    memset(&response, 0, sizeof(response));
+
+    copy_text(response.magic, MAGIC_SIZE, FILE_PACKET_MAGIC);
+    response.packet_type = PACKET_TYPE_FILE_STATUS_RESPONSE;
+    response.transfer_id = request->transfer_id;
+    response.sequence_number = request->sequence_number;
+    response.timestamp = (uint64_t)time(NULL);
+
+    if (transfer->active && request->transfer_id == transfer->transfer_id) {
+        response.total_chunks = transfer->total_chunks;
+        response.received_chunks = transfer->received_chunks;
+
+        for (uint32_t i = 0;
+             i < transfer->total_chunks && response.missing_count < MAX_MISSING_LIST;
+             i++) {
+            if (!transfer->received_bitmap[i]) {
+                response.missing_indices[response.missing_count++] = i;
+            }
+        }
+    }
+
+    send_encrypted_packet(
+        data_sock,
+        client_addr,
+        client_len,
+        session,
+        &response,
+        sizeof(response)
+    );
+}
+
+static void handle_file_complete(
+    int data_sock,
+    const struct sockaddr_in *client_addr,
+    socklen_t client_len,
+    const SecureSession *session,
+    FileTransferState *transfer,
+    const FileCompleteRequestPlain *request
+) {
+    FileCompleteResponsePlain response;
+    unsigned char computed_hash[crypto_hash_sha256_BYTES];
+    int success = 0;
+
+    memset(&response, 0, sizeof(response));
+    copy_text(response.magic, MAGIC_SIZE, FILE_PACKET_MAGIC);
+    response.packet_type = PACKET_TYPE_FILE_COMPLETE_RESPONSE;
+    response.transfer_id = request->transfer_id;
+    response.sequence_number = request->sequence_number;
+    response.timestamp = (uint64_t)time(NULL);
+
+    if (!transfer->active || request->transfer_id != transfer->transfer_id) {
+        copy_text(response.message, sizeof(response.message), "No active transfer");
+    } else if (transfer->received_chunks != transfer->total_chunks) {
+        copy_text(response.message, sizeof(response.message), "Missing chunks");
+    } else {
+        fflush(transfer->file);
+        fclose(transfer->file);
+        transfer->file = NULL;
+
+        if (compute_file_sha256(transfer->part_path, computed_hash) != 0) {
+            copy_text(response.message, sizeof(response.message), "Hash computation failed");
+        } else {
+            memcpy(response.computed_sha256, computed_hash, crypto_hash_sha256_BYTES);
+
+            if (sodium_memcmp(
+                    computed_hash,
+                    transfer->expected_sha256,
+                    crypto_hash_sha256_BYTES
+                ) != 0) {
+                copy_text(response.message, sizeof(response.message), "SHA-256 mismatch");
+            } else if (access(transfer->final_path, F_OK) == 0) {
+                copy_text(response.message, sizeof(response.message), "Final file already exists");
+            } else if (rename(transfer->part_path, transfer->final_path) != 0) {
+                copy_text(response.message, sizeof(response.message), "Rename failed");
+            } else {
+                success = 1;
+                transfer->complete = 1;
+                copy_text(response.final_file_path, sizeof(response.final_file_path), transfer->final_path);
+                copy_text(response.message, sizeof(response.message), "File transfer complete");
+            }
+        }
+    }
+
+    response.success = success;
+
+    send_encrypted_packet(
+        data_sock,
+        client_addr,
+        client_len,
+        session,
+        &response,
+        sizeof(response)
+    );
+
+    if (success) {
+        printf("File transfer complete | saved=%s\n", transfer->final_path);
+        cleanup_file_transfer(transfer);
+    }
+}
+
+static void handle_file_packet(
+    int data_sock,
+    const struct sockaddr_in *client_addr,
+    socklen_t client_len,
+    const SecureSession *session,
+    FileTransferState *transfer,
+    const EncryptedFilePacket *packet,
+    size_t packet_len
+) {
+    unsigned char plain[MAX_FILE_PLAINTEXT_SIZE];
+    size_t plain_len = 0;
+    uint32_t packet_type;
+
+    if (!same_client(session, client_addr)) {
+        printf("Encrypted file packet without active session ignored\n");
+        return;
+    }
+
+    if (decrypt_packet(
+            session,
+            packet,
+            packet_len,
+            plain,
+            sizeof(plain),
+            &plain_len
+        ) != 0) {
+        printf("Encrypted file packet authentication failed\n");
+        return;
+    }
+
+    if (plain_len < MAGIC_SIZE + sizeof(uint32_t)) {
+        printf("Invalid encrypted file plaintext size\n");
+        return;
+    }
+
+    if (strncmp((char *)plain, FILE_PACKET_MAGIC, MAGIC_SIZE) != 0) {
+        printf("Invalid encrypted file plaintext magic\n");
+        return;
+    }
+
+    memcpy(&packet_type, plain + MAGIC_SIZE, sizeof(packet_type));
+
+    switch (packet_type) {
+        case PACKET_TYPE_FILE_META:
+            if (plain_len == sizeof(FileMetaPlain)) {
+                handle_file_metadata(
+                    data_sock,
+                    client_addr,
+                    client_len,
+                    session,
+                    transfer,
+                    (const FileMetaPlain *)plain
+                );
+            }
+            break;
+
+        case PACKET_TYPE_FILE_CHUNK:
+            if (plain_len == sizeof(FileChunkPlain)) {
+                handle_file_chunk(
+                    data_sock,
+                    client_addr,
+                    client_len,
+                    session,
+                    transfer,
+                    (const FileChunkPlain *)plain
+                );
+            }
+            break;
+
+        case PACKET_TYPE_FILE_STATUS_REQUEST:
+            if (plain_len == sizeof(FileStatusRequestPlain)) {
+                handle_file_status_request(
+                    data_sock,
+                    client_addr,
+                    client_len,
+                    session,
+                    transfer,
+                    (const FileStatusRequestPlain *)plain
+                );
+            }
+            break;
+
+        case PACKET_TYPE_FILE_COMPLETE_REQUEST:
+            if (plain_len == sizeof(FileCompleteRequestPlain)) {
+                handle_file_complete(
+                    data_sock,
+                    client_addr,
+                    client_len,
+                    session,
+                    transfer,
+                    (const FileCompleteRequestPlain *)plain
+                );
+            }
+            break;
+
+        default:
+            send_file_failed(
+                data_sock,
+                client_addr,
+                client_len,
+                session,
+                0,
+                0,
+                "Unknown file packet type"
+            );
+            break;
+    }
+}
+
 static void handle_encrypted_data_request(
     int data_sock,
     const RobotIdentity *identity,
@@ -585,7 +1481,8 @@ static void handle_data_socket(
     int data_sock,
     const RobotIdentity *identity,
     const RobotSharedData *shared_data,
-    SecureSession *session
+    SecureSession *session,
+    FileTransferState *transfer
 ) {
     unsigned char buffer[2048];
     struct sockaddr_in client_addr;
@@ -619,6 +1516,7 @@ static void handle_data_socket(
             &client_addr,
             client_len
         );
+        cleanup_file_transfer(transfer);
         return;
     }
 
@@ -636,6 +1534,19 @@ static void handle_data_socket(
             (EncryptedDataRequestPacket *)buffer,
             &client_addr,
             client_len
+        );
+        return;
+    }
+
+    if (strncmp((char *)buffer, FILE_PACKET_MAGIC, MAGIC_SIZE) == 0) {
+        handle_file_packet(
+            data_sock,
+            &client_addr,
+            client_len,
+            session,
+            transfer,
+            (EncryptedFilePacket *)buffer,
+            (size_t)received
         );
         return;
     }
@@ -732,6 +1643,9 @@ int main() {
     SecureSession session;
     memset(&session, 0, sizeof(session));
 
+    FileTransferState transfer;
+    memset(&transfer, 0, sizeof(transfer));
+
     while (1) {
         fd_set read_fds;
         FD_ZERO(&read_fds);
@@ -752,10 +1666,11 @@ int main() {
         }
 
         if (FD_ISSET(data_sock, &read_fds)) {
-            handle_data_socket(data_sock, &identity, shared_data, &session);
+            handle_data_socket(data_sock, &identity, shared_data, &session, &transfer);
         }
     }
 
+    cleanup_file_transfer(&transfer);
     sodium_memzero(&session, sizeof(session));
     close(discovery_sock);
     close(data_sock);

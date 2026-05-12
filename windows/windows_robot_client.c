@@ -16,6 +16,7 @@
 #include <ws2tcpip.h>
 #include <windows.h>
 #include <iphlpapi.h>
+#include <direct.h>
 #include <sodium.h>
 
 #ifdef _MSC_VER
@@ -37,6 +38,21 @@
 #define DISCOVERY_SEND_ROUNDS 3
 #define DISCOVERY_ROUND_DELAY_MS 250
 
+#define CHUNK_SIZE 1200
+#define WINDOW_SIZE 16
+#define ACK_TIMEOUT_MS 500
+#define MAX_RETRIES 20
+#define MAX_FILE_SIZE (100ULL * 1024ULL * 1024ULL)
+#define FILE_NAME_SIZE 128
+#define FILE_PATH_SIZE 256
+#define FILE_MESSAGE_SIZE 128
+#define ACK_MESSAGE_SIZE 64
+#define MAX_MISSING_LIST 64
+#define FILE_PACKET_MAGIC "RFILE"
+#define MAX_FILE_PLAINTEXT_SIZE 1400
+#define MAX_FILE_CIPHERTEXT_SIZE \
+    (MAX_FILE_PLAINTEXT_SIZE + crypto_aead_xchacha20poly1305_ietf_ABYTES)
+
 #define DISCOVERY_REQUEST_MAGIC "RDISCOV"
 #define DISCOVERY_RESPONSE_MAGIC "RRESPON"
 #define KX_REQUEST_MAGIC "RKXREQ"
@@ -47,6 +63,18 @@
 #define DATA_RESPONSE_MAGIC "EDATAR"
 
 #define FRESHNESS_WINDOW_SECONDS 10
+
+enum {
+    PACKET_TYPE_FILE_META = 1,
+    PACKET_TYPE_FILE_META_ACK = 2,
+    PACKET_TYPE_FILE_CHUNK = 3,
+    PACKET_TYPE_FILE_CHUNK_ACK = 4,
+    PACKET_TYPE_FILE_STATUS_REQUEST = 5,
+    PACKET_TYPE_FILE_STATUS_RESPONSE = 6,
+    PACKET_TYPE_FILE_COMPLETE_REQUEST = 7,
+    PACKET_TYPE_FILE_COMPLETE_RESPONSE = 8,
+    PACKET_TYPE_FILE_TRANSFER_FAILED = 9
+};
 
 #pragma pack(push, 1)
 
@@ -135,6 +163,109 @@ typedef struct {
         crypto_aead_xchacha20poly1305_ietf_ABYTES
     ];
 } EncryptedDataResponsePacket;
+
+typedef struct {
+    char magic[MAGIC_SIZE];
+    uint32_t packet_type;
+    uint64_t transfer_id;
+    uint32_t sequence_number;
+    uint64_t timestamp;
+    char file_name[FILE_NAME_SIZE];
+    uint64_t file_size;
+    uint32_t chunk_size;
+    uint32_t total_chunks;
+    unsigned char file_sha256[crypto_hash_sha256_BYTES];
+} FileMetaPlain;
+
+typedef struct {
+    char magic[MAGIC_SIZE];
+    uint32_t packet_type;
+    uint64_t transfer_id;
+    uint32_t sequence_number;
+    uint64_t timestamp;
+    int32_t accepted;
+    char message[FILE_MESSAGE_SIZE];
+} FileMetaAckPlain;
+
+typedef struct {
+    char magic[MAGIC_SIZE];
+    uint32_t packet_type;
+    uint64_t transfer_id;
+    uint32_t sequence_number;
+    uint64_t timestamp;
+    uint32_t chunk_index;
+    uint32_t chunk_size;
+    uint64_t offset;
+    unsigned char data[CHUNK_SIZE];
+} FileChunkPlain;
+
+typedef struct {
+    char magic[MAGIC_SIZE];
+    uint32_t packet_type;
+    uint64_t transfer_id;
+    uint32_t sequence_number;
+    uint64_t timestamp;
+    uint32_t chunk_index;
+    int32_t status;
+    char message[ACK_MESSAGE_SIZE];
+} FileChunkAckPlain;
+
+typedef struct {
+    char magic[MAGIC_SIZE];
+    uint32_t packet_type;
+    uint64_t transfer_id;
+    uint32_t sequence_number;
+    uint64_t timestamp;
+} FileStatusRequestPlain;
+
+typedef struct {
+    char magic[MAGIC_SIZE];
+    uint32_t packet_type;
+    uint64_t transfer_id;
+    uint32_t sequence_number;
+    uint64_t timestamp;
+    uint32_t total_chunks;
+    uint32_t received_chunks;
+    uint32_t missing_count;
+    uint32_t missing_indices[MAX_MISSING_LIST];
+} FileStatusResponsePlain;
+
+typedef struct {
+    char magic[MAGIC_SIZE];
+    uint32_t packet_type;
+    uint64_t transfer_id;
+    uint32_t sequence_number;
+    uint64_t timestamp;
+} FileCompleteRequestPlain;
+
+typedef struct {
+    char magic[MAGIC_SIZE];
+    uint32_t packet_type;
+    uint64_t transfer_id;
+    uint32_t sequence_number;
+    uint64_t timestamp;
+    int32_t success;
+    char final_file_path[FILE_PATH_SIZE];
+    unsigned char computed_sha256[crypto_hash_sha256_BYTES];
+    char message[FILE_MESSAGE_SIZE];
+} FileCompleteResponsePlain;
+
+typedef struct {
+    char magic[MAGIC_SIZE];
+    uint32_t packet_type;
+    uint64_t transfer_id;
+    uint32_t sequence_number;
+    uint64_t timestamp;
+    int32_t error_code;
+    char message[FILE_MESSAGE_SIZE];
+} FileTransferFailedPlain;
+
+typedef struct {
+    char magic[MAGIC_SIZE];
+    unsigned char nonce[crypto_aead_xchacha20poly1305_ietf_NPUBBYTES];
+    uint32_t ciphertext_len;
+    unsigned char ciphertext[MAX_FILE_CIPHERTEXT_SIZE];
+} EncryptedFilePacket;
 
 #pragma pack(pop)
 
@@ -251,6 +382,243 @@ static int is_timestamp_fresh(uint64_t packet_timestamp) {
     }
 
     return 1;
+}
+
+static int has_onex_extension(const char *path) {
+    size_t length = strlen(path);
+
+    if (length < 5) {
+        return 0;
+    }
+
+    return _stricmp(path + length - 5, ".onex") == 0;
+}
+
+static const char *base_name_from_path(const char *path) {
+    const char *slash = strrchr(path, '/');
+    const char *backslash = strrchr(path, '\\');
+    const char *base = path;
+
+    if (slash != NULL && slash + 1 > base) {
+        base = slash + 1;
+    }
+
+    if (backslash != NULL && backslash + 1 > base) {
+        base = backslash + 1;
+    }
+
+    return base;
+}
+
+static int sanitize_filename(const char *file_name) {
+    if (file_name == NULL || file_name[0] == '\0') {
+        return 0;
+    }
+
+    if (strstr(file_name, "../") != NULL ||
+        strstr(file_name, "..\\") != NULL ||
+        strchr(file_name, '/') != NULL ||
+        strchr(file_name, '\\') != NULL ||
+        strchr(file_name, ':') != NULL) {
+        return 0;
+    }
+
+    return has_onex_extension(file_name);
+}
+
+static int get_file_size(FILE *file, uint64_t *size_out) {
+    if (_fseeki64(file, 0, SEEK_END) != 0) {
+        return -1;
+    }
+
+    __int64 size = _ftelli64(file);
+
+    if (size < 0) {
+        return -1;
+    }
+
+    if (_fseeki64(file, 0, SEEK_SET) != 0) {
+        return -1;
+    }
+
+    *size_out = (uint64_t)size;
+    return 0;
+}
+
+static int compute_file_sha256(
+    const char *path,
+    unsigned char hash[crypto_hash_sha256_BYTES],
+    uint64_t *file_size
+) {
+    FILE *file = fopen(path, "rb");
+
+    if (file == NULL) {
+        return -1;
+    }
+
+    if (get_file_size(file, file_size) != 0) {
+        fclose(file);
+        return -1;
+    }
+
+    crypto_hash_sha256_state state;
+    unsigned char buffer[4096];
+    size_t read_count;
+
+    crypto_hash_sha256_init(&state);
+
+    while ((read_count = fread(buffer, 1, sizeof(buffer), file)) > 0) {
+        crypto_hash_sha256_update(&state, buffer, read_count);
+    }
+
+    if (ferror(file)) {
+        fclose(file);
+        return -1;
+    }
+
+    crypto_hash_sha256_final(&state, hash);
+    fclose(file);
+    return 0;
+}
+
+static int encrypt_packet(
+    const SecureSession *session,
+    const void *plain,
+    size_t plain_len,
+    EncryptedFilePacket *packet,
+    size_t *packet_len
+) {
+    unsigned long long encrypted_len = 0;
+
+    if (plain_len > MAX_FILE_PLAINTEXT_SIZE) {
+        return -1;
+    }
+
+    memset(packet, 0, sizeof(*packet));
+    copy_text(packet->magic, MAGIC_SIZE, FILE_PACKET_MAGIC);
+    randombytes_buf(packet->nonce, sizeof(packet->nonce));
+
+    if (crypto_aead_xchacha20poly1305_ietf_encrypt(
+            packet->ciphertext,
+            &encrypted_len,
+            plain,
+            plain_len,
+            NULL,
+            0,
+            NULL,
+            packet->nonce,
+            session->tx_key
+        ) != 0) {
+        return -1;
+    }
+
+    packet->ciphertext_len = (uint32_t)encrypted_len;
+    *packet_len = MAGIC_SIZE + sizeof(packet->nonce) +
+                  sizeof(packet->ciphertext_len) + packet->ciphertext_len;
+    return 0;
+}
+
+static int decrypt_packet(
+    const SecureSession *session,
+    const EncryptedFilePacket *packet,
+    size_t packet_len,
+    void *plain,
+    size_t plain_capacity,
+    size_t *plain_len
+) {
+    unsigned long long decrypted_len = 0;
+    size_t header_len = MAGIC_SIZE + sizeof(packet->nonce) +
+                        sizeof(packet->ciphertext_len);
+
+    if (packet_len < header_len ||
+        strncmp(packet->magic, FILE_PACKET_MAGIC, MAGIC_SIZE) != 0 ||
+        packet->ciphertext_len > MAX_FILE_CIPHERTEXT_SIZE ||
+        packet_len != header_len + packet->ciphertext_len) {
+        return -1;
+    }
+
+    if (crypto_aead_xchacha20poly1305_ietf_decrypt(
+            plain,
+            &decrypted_len,
+            NULL,
+            packet->ciphertext,
+            packet->ciphertext_len,
+            NULL,
+            0,
+            packet->nonce,
+            session->rx_key
+        ) != 0) {
+        return -1;
+    }
+
+    if (decrypted_len > plain_capacity) {
+        return -1;
+    }
+
+    *plain_len = (size_t)decrypted_len;
+    return 0;
+}
+
+static int send_encrypted_packet(
+    SOCKET data_sock,
+    const struct sockaddr_in *robot_data_addr,
+    const SecureSession *session,
+    const void *plain,
+    size_t plain_len
+) {
+    EncryptedFilePacket packet;
+    size_t packet_len = 0;
+
+    if (encrypt_packet(session, plain, plain_len, &packet, &packet_len) != 0) {
+        return -1;
+    }
+
+    if (sendto(
+            data_sock,
+            (const char *)&packet,
+            (int)packet_len,
+            0,
+            (const struct sockaddr *)robot_data_addr,
+            sizeof(*robot_data_addr)
+        ) == SOCKET_ERROR) {
+        return -1;
+    }
+
+    return 0;
+}
+
+static int receive_encrypted_packet(
+    SOCKET data_sock,
+    const SecureSession *session,
+    void *plain,
+    size_t plain_capacity,
+    size_t *plain_len
+) {
+    EncryptedFilePacket packet;
+    struct sockaddr_in sender_addr;
+    int sender_len = sizeof(sender_addr);
+
+    int received = recvfrom(
+        data_sock,
+        (char *)&packet,
+        sizeof(packet),
+        0,
+        (struct sockaddr *)&sender_addr,
+        &sender_len
+    );
+
+    if (received == SOCKET_ERROR) {
+        return -1;
+    }
+
+    return decrypt_packet(
+        session,
+        &packet,
+        (size_t)received,
+        plain,
+        plain_capacity,
+        plain_len
+    );
 }
 
 static int load_trusted_robots(
@@ -805,6 +1173,414 @@ static int receive_encrypted_data_response(
     return 0;
 }
 
+static int send_file_metadata(
+    SOCKET data_sock,
+    const struct sockaddr_in *robot_data_addr,
+    SecureSession *session,
+    uint64_t transfer_id,
+    const char *file_name,
+    uint64_t file_size,
+    uint32_t total_chunks,
+    const unsigned char file_hash[crypto_hash_sha256_BYTES]
+) {
+    FileMetaPlain meta;
+    unsigned char plain[MAX_FILE_PLAINTEXT_SIZE];
+    size_t plain_len = 0;
+
+    memset(&meta, 0, sizeof(meta));
+    copy_text(meta.magic, MAGIC_SIZE, FILE_PACKET_MAGIC);
+    meta.packet_type = PACKET_TYPE_FILE_META;
+    meta.transfer_id = transfer_id;
+    meta.sequence_number = session->next_request_sequence++;
+    meta.timestamp = (uint64_t)time(NULL);
+    copy_text(meta.file_name, sizeof(meta.file_name), file_name);
+    meta.file_size = file_size;
+    meta.chunk_size = CHUNK_SIZE;
+    meta.total_chunks = total_chunks;
+    memcpy(meta.file_sha256, file_hash, crypto_hash_sha256_BYTES);
+
+    for (int retry = 0; retry < MAX_RETRIES; retry++) {
+        if (send_encrypted_packet(
+                data_sock,
+                robot_data_addr,
+                session,
+                &meta,
+                sizeof(meta)
+            ) != 0) {
+            return -1;
+        }
+
+        if (receive_encrypted_packet(
+                data_sock,
+                session,
+                plain,
+                sizeof(plain),
+                &plain_len
+            ) != 0) {
+            continue;
+        }
+
+        if (plain_len == sizeof(FileMetaAckPlain)) {
+            FileMetaAckPlain *ack = (FileMetaAckPlain *)plain;
+
+            if (strncmp(ack->magic, FILE_PACKET_MAGIC, MAGIC_SIZE) == 0 &&
+                ack->packet_type == PACKET_TYPE_FILE_META_ACK &&
+                ack->transfer_id == transfer_id &&
+                is_timestamp_fresh(ack->timestamp)) {
+                printf("File metadata ACK: %s\n", ack->message);
+                return ack->accepted ? 0 : -1;
+            }
+        }
+
+        if (plain_len == sizeof(FileTransferFailedPlain)) {
+            FileTransferFailedPlain *failed = (FileTransferFailedPlain *)plain;
+            printf("Robot rejected transfer: %s\n", failed->message);
+            return -1;
+        }
+    }
+
+    printf("No file metadata ACK received\n");
+    return -1;
+}
+
+static int send_file_status_request(
+    SOCKET data_sock,
+    const struct sockaddr_in *robot_data_addr,
+    SecureSession *session,
+    uint64_t transfer_id
+) {
+    FileStatusRequestPlain request;
+    memset(&request, 0, sizeof(request));
+
+    copy_text(request.magic, MAGIC_SIZE, FILE_PACKET_MAGIC);
+    request.packet_type = PACKET_TYPE_FILE_STATUS_REQUEST;
+    request.transfer_id = transfer_id;
+    request.sequence_number = session->next_request_sequence++;
+    request.timestamp = (uint64_t)time(NULL);
+
+    return send_encrypted_packet(
+        data_sock,
+        robot_data_addr,
+        session,
+        &request,
+        sizeof(request)
+    );
+}
+
+static int send_one_file_chunk(
+    SOCKET data_sock,
+    const struct sockaddr_in *robot_data_addr,
+    SecureSession *session,
+    FILE *file,
+    uint64_t transfer_id,
+    uint32_t chunk_index,
+    uint64_t file_size
+) {
+    FileChunkPlain chunk;
+    uint64_t offset = (uint64_t)chunk_index * CHUNK_SIZE;
+    uint32_t expected_size = CHUNK_SIZE;
+
+    if (offset >= file_size) {
+        return -1;
+    }
+
+    if (offset + expected_size > file_size) {
+        expected_size = (uint32_t)(file_size - offset);
+    }
+
+    memset(&chunk, 0, sizeof(chunk));
+    copy_text(chunk.magic, MAGIC_SIZE, FILE_PACKET_MAGIC);
+    chunk.packet_type = PACKET_TYPE_FILE_CHUNK;
+    chunk.transfer_id = transfer_id;
+    chunk.sequence_number = session->next_request_sequence++;
+    chunk.timestamp = (uint64_t)time(NULL);
+    chunk.chunk_index = chunk_index;
+    chunk.chunk_size = expected_size;
+    chunk.offset = offset;
+
+    if (_fseeki64(file, (__int64)offset, SEEK_SET) != 0) {
+        return -1;
+    }
+
+    if (fread(chunk.data, 1, expected_size, file) != expected_size) {
+        return -1;
+    }
+
+    return send_encrypted_packet(
+        data_sock,
+        robot_data_addr,
+        session,
+        &chunk,
+        sizeof(chunk)
+    );
+}
+
+static int send_file_chunks(
+    SOCKET data_sock,
+    const struct sockaddr_in *robot_data_addr,
+    SecureSession *session,
+    const char *file_path,
+    uint64_t transfer_id,
+    uint64_t file_size,
+    uint32_t total_chunks
+) {
+    FILE *file = fopen(file_path, "rb");
+    unsigned char *acked = NULL;
+    uint32_t acked_count = 0;
+    uint32_t base = 0;
+    int retry_round = 0;
+
+    if (file == NULL) {
+        return -1;
+    }
+
+    acked = (unsigned char *)calloc(total_chunks, 1);
+
+    if (acked == NULL) {
+        fclose(file);
+        return -1;
+    }
+
+    while (acked_count < total_chunks && retry_round < MAX_RETRIES) {
+        uint32_t sent_this_round = 0;
+        uint32_t acked_before_round = acked_count;
+
+        while (base < total_chunks && acked[base]) {
+            base++;
+        }
+
+        for (uint32_t i = base;
+             i < total_chunks && i < base + WINDOW_SIZE;
+             i++) {
+            if (!acked[i]) {
+                if (send_one_file_chunk(
+                        data_sock,
+                        robot_data_addr,
+                        session,
+                        file,
+                        transfer_id,
+                        i,
+                        file_size
+                    ) == 0) {
+                    sent_this_round++;
+                }
+            }
+        }
+
+        for (uint32_t i = 0; i < sent_this_round + WINDOW_SIZE; i++) {
+            unsigned char plain[MAX_FILE_PLAINTEXT_SIZE];
+            size_t plain_len = 0;
+
+            if (receive_encrypted_packet(
+                    data_sock,
+                    session,
+                    plain,
+                    sizeof(plain),
+                    &plain_len
+                ) != 0) {
+                break;
+            }
+
+            if (plain_len == sizeof(FileChunkAckPlain)) {
+                FileChunkAckPlain *ack = (FileChunkAckPlain *)plain;
+
+                if (strncmp(ack->magic, FILE_PACKET_MAGIC, MAGIC_SIZE) == 0 &&
+                    ack->packet_type == PACKET_TYPE_FILE_CHUNK_ACK &&
+                    ack->transfer_id == transfer_id &&
+                    ack->chunk_index < total_chunks &&
+                    ack->status == 1 &&
+                    !acked[ack->chunk_index]) {
+                    acked[ack->chunk_index] = 1;
+                    acked_count++;
+                }
+            } else if (plain_len == sizeof(FileStatusResponsePlain)) {
+                FileStatusResponsePlain *status = (FileStatusResponsePlain *)plain;
+                printf(
+                    "Robot status: %u/%u chunks received, missing listed=%u\n",
+                    status->received_chunks,
+                    status->total_chunks,
+                    status->missing_count
+                );
+            } else if (plain_len == sizeof(FileTransferFailedPlain)) {
+                FileTransferFailedPlain *failed = (FileTransferFailedPlain *)plain;
+                printf("Robot transfer failure: %s\n", failed->message);
+                free(acked);
+                fclose(file);
+                return -1;
+            }
+        }
+
+        if (acked_count == total_chunks) {
+            break;
+        }
+
+        if (acked_count > acked_before_round) {
+            retry_round = 0;
+        } else {
+            retry_round++;
+        }
+
+        if (retry_round > 0 && retry_round % 4 == 0) {
+            send_file_status_request(
+                data_sock,
+                robot_data_addr,
+                session,
+                transfer_id
+            );
+        }
+
+        printf(
+            "File transfer progress: %u/%u chunks ACKed\n",
+            acked_count,
+            total_chunks
+        );
+    }
+
+    free(acked);
+    fclose(file);
+
+    if (acked_count != total_chunks) {
+        printf("File transfer failed: too many missing ACKs\n");
+        return -1;
+    }
+
+    return 0;
+}
+
+static int handle_file_complete(
+    SOCKET data_sock,
+    const struct sockaddr_in *robot_data_addr,
+    SecureSession *session,
+    uint64_t transfer_id
+) {
+    FileCompleteRequestPlain request;
+    unsigned char plain[MAX_FILE_PLAINTEXT_SIZE];
+    size_t plain_len = 0;
+
+    memset(&request, 0, sizeof(request));
+    copy_text(request.magic, MAGIC_SIZE, FILE_PACKET_MAGIC);
+    request.packet_type = PACKET_TYPE_FILE_COMPLETE_REQUEST;
+    request.transfer_id = transfer_id;
+    request.sequence_number = session->next_request_sequence++;
+    request.timestamp = (uint64_t)time(NULL);
+
+    for (int retry = 0; retry < MAX_RETRIES; retry++) {
+        if (send_encrypted_packet(
+                data_sock,
+                robot_data_addr,
+                session,
+                &request,
+                sizeof(request)
+            ) != 0) {
+            return -1;
+        }
+
+        if (receive_encrypted_packet(
+                data_sock,
+                session,
+                plain,
+                sizeof(plain),
+                &plain_len
+            ) != 0) {
+            continue;
+        }
+
+        if (plain_len == sizeof(FileCompleteResponsePlain)) {
+            FileCompleteResponsePlain *response = (FileCompleteResponsePlain *)plain;
+
+            if (strncmp(response->magic, FILE_PACKET_MAGIC, MAGIC_SIZE) == 0 &&
+                response->packet_type == PACKET_TYPE_FILE_COMPLETE_RESPONSE &&
+                response->transfer_id == transfer_id &&
+                is_timestamp_fresh(response->timestamp)) {
+                printf("Robot complete response: %s\n", response->message);
+
+                if (response->success) {
+                    printf("Robot saved file: %s\n", response->final_file_path);
+                    return 0;
+                }
+
+                return -1;
+            }
+        }
+    }
+
+    printf("No file complete response received\n");
+    return -1;
+}
+
+static int transfer_onex_file(
+    SOCKET data_sock,
+    const struct sockaddr_in *robot_data_addr,
+    SecureSession *session,
+    const char *file_path
+) {
+    char file_name[FILE_NAME_SIZE];
+    const char *base_name = base_name_from_path(file_path);
+    uint64_t file_size = 0;
+    uint32_t total_chunks = 0;
+    uint64_t transfer_id = 0;
+    unsigned char file_hash[crypto_hash_sha256_BYTES];
+
+    if (!has_onex_extension(file_path) || !sanitize_filename(base_name)) {
+        printf("Only safe .onex file names are allowed\n");
+        return -1;
+    }
+
+    copy_text(file_name, sizeof(file_name), base_name);
+
+    if (compute_file_sha256(file_path, file_hash, &file_size) != 0) {
+        printf("Failed to open/hash .onex file\n");
+        return -1;
+    }
+
+    if (file_size == 0 || file_size > MAX_FILE_SIZE) {
+        printf("Invalid file size. Max allowed is %llu bytes\n", (unsigned long long)MAX_FILE_SIZE);
+        return -1;
+    }
+
+    total_chunks = (uint32_t)((file_size + CHUNK_SIZE - 1) / CHUNK_SIZE);
+    randombytes_buf(&transfer_id, sizeof(transfer_id));
+
+    printf(
+        "Sending .onex file: %s | size=%llu | chunks=%u\n",
+        file_name,
+        (unsigned long long)file_size,
+        total_chunks
+    );
+
+    if (send_file_metadata(
+            data_sock,
+            robot_data_addr,
+            session,
+            transfer_id,
+            file_name,
+            file_size,
+            total_chunks,
+            file_hash
+        ) != 0) {
+        return -1;
+    }
+
+    if (send_file_chunks(
+            data_sock,
+            robot_data_addr,
+            session,
+            file_path,
+            transfer_id,
+            file_size,
+            total_chunks
+        ) != 0) {
+        return -1;
+    }
+
+    return handle_file_complete(
+        data_sock,
+        robot_data_addr,
+        session,
+        transfer_id
+    );
+}
+
 int main() {
     if (sodium_init() < 0) {
         printf("libsodium initialization failed\n");
@@ -1131,6 +1907,58 @@ int main() {
         WSACleanup();
         return 1;
     }
+
+    DWORD ack_timeout_ms = ACK_TIMEOUT_MS;
+
+    setsockopt(
+        data_sock,
+        SOL_SOCKET,
+        SO_RCVTIMEO,
+        (char *)&ack_timeout_ms,
+        sizeof(ack_timeout_ms)
+    );
+
+    int ch;
+
+    while ((ch = getchar()) != '\n' && ch != EOF) {
+    }
+
+    char onex_path[512];
+
+    printf("Enter .onex file path to send: ");
+
+    if (fgets(onex_path, sizeof(onex_path), stdin) == NULL) {
+        printf("No file path entered.\n");
+        closesocket(data_sock);
+        closesocket(discovery_sock);
+        WSACleanup();
+        return 1;
+    }
+
+    remove_newline(onex_path);
+
+    if (transfer_onex_file(
+            data_sock,
+            &robot_data_addr,
+            &session,
+            onex_path
+        ) != 0) {
+        printf("Secure .onex file transfer failed.\n");
+        closesocket(data_sock);
+        closesocket(discovery_sock);
+        WSACleanup();
+        return 1;
+    }
+
+    printf("Secure .onex file transfer finished. Starting shared-memory data polling.\n");
+
+    setsockopt(
+        data_sock,
+        SOL_SOCKET,
+        SO_RCVTIMEO,
+        (char *)&timeout_ms,
+        sizeof(timeout_ms)
+    );
 
     while (1) {
         uint64_t data_challenge = 0;
