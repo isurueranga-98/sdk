@@ -17,7 +17,9 @@
 #include <windows.h>
 #include <sodium.h>
 
+#ifdef _MSC_VER
 #pragma comment(lib, "ws2_32.lib")
+#endif
 
 #define TRUSTED_FILE "trusted_robots.txt"
 
@@ -193,6 +195,43 @@ static void remove_newline(char *text) {
     text[strcspn(text, "\r\n")] = '\0';
 }
 
+static size_t bounded_string_length(const char *text, size_t max_size) {
+    size_t length = 0;
+
+    while (length < max_size && text[length] != '\0') {
+        length++;
+    }
+
+    return length;
+}
+
+static void copy_fixed_string(
+    char *destination,
+    size_t destination_size,
+    const char *source,
+    size_t source_size
+) {
+    size_t copy_size;
+
+    if (destination_size == 0) {
+        return;
+    }
+
+    memset(destination, 0, destination_size);
+
+    copy_size = bounded_string_length(source, source_size);
+
+    if (copy_size >= destination_size) {
+        copy_size = destination_size - 1;
+    }
+
+    memcpy(destination, source, copy_size);
+}
+
+static void copy_literal_magic(char destination[MAGIC_SIZE], const char *magic) {
+    copy_fixed_string(destination, MAGIC_SIZE, magic, strlen(magic));
+}
+
 static int is_timestamp_fresh(uint64_t packet_timestamp) {
     uint64_t now = (uint64_t)time(NULL);
 
@@ -233,8 +272,18 @@ static int load_trusted_robots(
 
         memset(&trusted_robots[count], 0, sizeof(TrustedRobot));
 
-        strncpy(trusted_robots[count].device_id, device_id, DEVICE_ID_SIZE - 1);
-        strncpy(trusted_robots[count].serial_number, serial_number, SERIAL_SIZE - 1);
+        copy_fixed_string(
+            trusted_robots[count].device_id,
+            DEVICE_ID_SIZE,
+            device_id,
+            strlen(device_id)
+        );
+        copy_fixed_string(
+            trusted_robots[count].serial_number,
+            SERIAL_SIZE,
+            serial_number,
+            strlen(serial_number)
+        );
 
         if (hex_to_bytes(
                 public_key_hex,
@@ -252,6 +301,56 @@ static int load_trusted_robots(
 }
 
 static int save_trusted_robot(const TrustedRobot *robot) {
+    FILE *read_file = fopen(TRUSTED_FILE, "r");
+
+    if (read_file != NULL) {
+        char line[512];
+
+        while (fgets(line, sizeof(line), read_file)) {
+            unsigned char existing_public_key[crypto_sign_PUBLICKEYBYTES];
+
+            remove_newline(line);
+
+            char *device_id = strtok(line, "|");
+            char *serial_number = strtok(NULL, "|");
+            char *public_key_hex = strtok(NULL, "|");
+
+            if (device_id == NULL || serial_number == NULL || public_key_hex == NULL) {
+                continue;
+            }
+
+            if (strncmp(device_id, robot->device_id, DEVICE_ID_SIZE) != 0 ||
+                strncmp(serial_number, robot->serial_number, SERIAL_SIZE) != 0) {
+                continue;
+            }
+
+            fclose(read_file);
+
+            if (hex_to_bytes(
+                    public_key_hex,
+                    existing_public_key,
+                    crypto_sign_PUBLICKEYBYTES
+                ) != 0) {
+                printf("WARNING: Existing trusted robot entry has invalid public key.\n");
+                return -1;
+            }
+
+            if (sodium_memcmp(
+                    existing_public_key,
+                    robot->public_key,
+                    crypto_sign_PUBLICKEYBYTES
+                ) == 0) {
+                printf("Robot is already saved in trusted_robots.txt. Not duplicating entry.\n");
+                return 0;
+            }
+
+            printf("WARNING: Trusted robot identity conflict. Public key mismatch.\n");
+            return -1;
+        }
+
+        fclose(read_file);
+    }
+
     FILE *file = fopen(TRUSTED_FILE, "a");
 
     if (file == NULL) {
@@ -337,9 +436,19 @@ static int perform_key_exchange(
     KeyExchangeRequestPacket request;
     memset(&request, 0, sizeof(request));
 
-    strncpy(request.magic, KX_REQUEST_MAGIC, MAGIC_SIZE);
-    strncpy(request.device_id, robot->device_id, DEVICE_ID_SIZE - 1);
-    strncpy(request.serial_number, robot->serial_number, SERIAL_SIZE - 1);
+    copy_literal_magic(request.magic, KX_REQUEST_MAGIC);
+    copy_fixed_string(
+        request.device_id,
+        DEVICE_ID_SIZE,
+        robot->device_id,
+        DEVICE_ID_SIZE
+    );
+    copy_fixed_string(
+        request.serial_number,
+        SERIAL_SIZE,
+        robot->serial_number,
+        SERIAL_SIZE
+    );
     memcpy(
         request.client_kx_public_key,
         session->client_kx_public_key,
@@ -463,9 +572,19 @@ static int send_encrypted_data_request(
 
     randombytes_buf(challenge_out, sizeof(*challenge_out));
 
-    strncpy(body.magic, DATA_REQUEST_MAGIC, MAGIC_SIZE);
-    strncpy(body.device_id, robot->device_id, DEVICE_ID_SIZE - 1);
-    strncpy(body.serial_number, robot->serial_number, SERIAL_SIZE - 1);
+    copy_literal_magic(body.magic, DATA_REQUEST_MAGIC);
+    copy_fixed_string(
+        body.device_id,
+        DEVICE_ID_SIZE,
+        robot->device_id,
+        DEVICE_ID_SIZE
+    );
+    copy_fixed_string(
+        body.serial_number,
+        SERIAL_SIZE,
+        robot->serial_number,
+        SERIAL_SIZE
+    );
     body.request_sequence = session->next_request_sequence++;
     body.challenge_nonce = *challenge_out;
     body.timestamp = (uint64_t)time(NULL);
@@ -474,7 +593,7 @@ static int send_encrypted_data_request(
     unsigned long long encrypted_len = 0;
     memset(&packet, 0, sizeof(packet));
 
-    strncpy(packet.magic, ENCRYPTED_DATA_REQUEST_MAGIC, MAGIC_SIZE);
+    copy_literal_magic(packet.magic, ENCRYPTED_DATA_REQUEST_MAGIC);
     randombytes_buf(packet.nonce, sizeof(packet.nonce));
 
     if (crypto_aead_xchacha20poly1305_ietf_encrypt(
@@ -679,7 +798,7 @@ int main() {
     DiscoveryRequestPacket discovery_request;
     memset(&discovery_request, 0, sizeof(discovery_request));
 
-    strncpy(discovery_request.magic, DISCOVERY_REQUEST_MAGIC, MAGIC_SIZE);
+    copy_literal_magic(discovery_request.magic, DISCOVERY_REQUEST_MAGIC);
     discovery_request.challenge_nonce = discovery_challenge;
     discovery_request.timestamp = (uint64_t)time(NULL);
 
@@ -725,22 +844,52 @@ int main() {
         }
 
         if (received != sizeof(DiscoveryResponsePacket)) {
-            printf("Invalid discovery response size ignored\n");
+            printf("Robot rejected: invalid discovery response size\n");
             continue;
         }
 
+        char response_device_id[DEVICE_ID_SIZE];
+        char response_serial_number[SERIAL_SIZE];
+        char response_ip_address[IP_SIZE];
+
+        copy_fixed_string(
+            response_device_id,
+            sizeof(response_device_id),
+            response.body.device_id,
+            DEVICE_ID_SIZE
+        );
+        copy_fixed_string(
+            response_serial_number,
+            sizeof(response_serial_number),
+            response.body.serial_number,
+            SERIAL_SIZE
+        );
+        copy_fixed_string(
+            response_ip_address,
+            sizeof(response_ip_address),
+            response.body.ip_address,
+            IP_SIZE
+        );
+
+        printf(
+            "Received response from robot: %s %s %s\n",
+            response_device_id,
+            response_serial_number,
+            response_ip_address
+        );
+
         if (strncmp(response.body.magic, DISCOVERY_RESPONSE_MAGIC, MAGIC_SIZE) != 0) {
-            printf("Invalid discovery response magic ignored\n");
+            printf("Robot rejected: invalid discovery response magic\n");
             continue;
         }
 
         if (response.body.challenge_nonce != discovery_challenge) {
-            printf("Discovery challenge mismatch ignored\n");
+            printf("Robot rejected: discovery challenge mismatch\n");
             continue;
         }
 
         if (!is_timestamp_fresh(response.body.timestamp)) {
-            printf("Old discovery response ignored\n");
+            printf("Robot rejected: old discovery response timestamp\n");
             continue;
         }
 
@@ -752,7 +901,7 @@ int main() {
         );
 
         if (self_signature_ok != 0) {
-            printf("Robot self-signature invalid. Ignored.\n");
+            printf("Robot rejected: self-signature verification failed\n");
             continue;
         }
 
@@ -778,16 +927,15 @@ int main() {
                     response.body.public_key
                 )) {
                 trusted = 1;
+                printf("Robot is trusted\n");
             } else {
-                printf(
-                    "WARNING: Robot %s / %s has different public key. Possible spoofing. Ignored.\n",
-                    response.body.device_id,
-                    response.body.serial_number
-                );
+                printf("WARNING: Trusted robot identity conflict. Public key mismatch.\n");
+                printf("Robot rejected: possible spoofing or identity conflict\n");
                 continue;
             }
         } else {
             trusted = 0;
+            printf("Robot is new/unpaired\n");
         }
 
         if (is_duplicate_robot(
@@ -796,14 +944,30 @@ int main() {
                 response.body.device_id,
                 response.body.serial_number
             )) {
+            printf("Robot rejected: duplicate discovery response in this run\n");
             continue;
         }
 
         memset(&robots[robot_count], 0, sizeof(DiscoveredRobot));
 
-        strncpy(robots[robot_count].device_id, response.body.device_id, DEVICE_ID_SIZE - 1);
-        strncpy(robots[robot_count].serial_number, response.body.serial_number, SERIAL_SIZE - 1);
-        strncpy(robots[robot_count].ip_address, response.body.ip_address, IP_SIZE - 1);
+        copy_fixed_string(
+            robots[robot_count].device_id,
+            DEVICE_ID_SIZE,
+            response.body.device_id,
+            DEVICE_ID_SIZE
+        );
+        copy_fixed_string(
+            robots[robot_count].serial_number,
+            SERIAL_SIZE,
+            response.body.serial_number,
+            SERIAL_SIZE
+        );
+        copy_fixed_string(
+            robots[robot_count].ip_address,
+            IP_SIZE,
+            response.body.ip_address,
+            IP_SIZE
+        );
 
         robots[robot_count].service_port = response.body.service_port;
         memcpy(
@@ -826,6 +990,8 @@ int main() {
 
         robot_count++;
     }
+
+    printf("Discovery completed. Valid robots found: %d\n", robot_count);
 
     if (robot_count == 0) {
         printf("No robots found.\n");
@@ -870,8 +1036,18 @@ int main() {
         TrustedRobot new_trusted_robot;
         memset(&new_trusted_robot, 0, sizeof(new_trusted_robot));
 
-        strncpy(new_trusted_robot.device_id, selected_robot.device_id, DEVICE_ID_SIZE - 1);
-        strncpy(new_trusted_robot.serial_number, selected_robot.serial_number, SERIAL_SIZE - 1);
+        copy_fixed_string(
+            new_trusted_robot.device_id,
+            DEVICE_ID_SIZE,
+            selected_robot.device_id,
+            DEVICE_ID_SIZE
+        );
+        copy_fixed_string(
+            new_trusted_robot.serial_number,
+            SERIAL_SIZE,
+            selected_robot.serial_number,
+            SERIAL_SIZE
+        );
         memcpy(
             new_trusted_robot.public_key,
             selected_robot.public_key,
