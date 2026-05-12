@@ -17,7 +17,9 @@
 #include <windows.h>
 #include <sodium.h>
 
+#ifdef _MSC_VER
 #pragma comment(lib, "ws2_32.lib")
+#endif
 
 #define TRUSTED_FILE "trusted_robots.txt"
 
@@ -193,6 +195,47 @@ static void remove_newline(char *text) {
     text[strcspn(text, "\r\n")] = '\0';
 }
 
+static void copy_text_field(
+    char *destination,
+    size_t destination_size,
+    const char *source,
+    size_t source_size
+) {
+    size_t length = 0;
+
+    if (destination_size == 0) {
+        return;
+    }
+
+    while (length + 1 < destination_size &&
+           length < source_size &&
+           source[length] != '\0') {
+        destination[length] = source[length];
+        length++;
+    }
+
+    destination[length] = '\0';
+}
+
+static void copy_text(
+    char *destination,
+    size_t destination_size,
+    const char *source
+) {
+    size_t length = 0;
+
+    if (destination_size == 0) {
+        return;
+    }
+
+    while (length + 1 < destination_size && source[length] != '\0') {
+        destination[length] = source[length];
+        length++;
+    }
+
+    destination[length] = '\0';
+}
+
 static int is_timestamp_fresh(uint64_t packet_timestamp) {
     uint64_t now = (uint64_t)time(NULL);
 
@@ -233,8 +276,8 @@ static int load_trusted_robots(
 
         memset(&trusted_robots[count], 0, sizeof(TrustedRobot));
 
-        strncpy(trusted_robots[count].device_id, device_id, DEVICE_ID_SIZE - 1);
-        strncpy(trusted_robots[count].serial_number, serial_number, SERIAL_SIZE - 1);
+        copy_text(trusted_robots[count].device_id, DEVICE_ID_SIZE, device_id);
+        copy_text(trusted_robots[count].serial_number, SERIAL_SIZE, serial_number);
 
         if (hex_to_bytes(
                 public_key_hex,
@@ -337,9 +380,9 @@ static int perform_key_exchange(
     KeyExchangeRequestPacket request;
     memset(&request, 0, sizeof(request));
 
-    strncpy(request.magic, KX_REQUEST_MAGIC, MAGIC_SIZE);
-    strncpy(request.device_id, robot->device_id, DEVICE_ID_SIZE - 1);
-    strncpy(request.serial_number, robot->serial_number, SERIAL_SIZE - 1);
+    copy_text(request.magic, MAGIC_SIZE, KX_REQUEST_MAGIC);
+    copy_text(request.device_id, DEVICE_ID_SIZE, robot->device_id);
+    copy_text(request.serial_number, SERIAL_SIZE, robot->serial_number);
     memcpy(
         request.client_kx_public_key,
         session->client_kx_public_key,
@@ -463,9 +506,9 @@ static int send_encrypted_data_request(
 
     randombytes_buf(challenge_out, sizeof(*challenge_out));
 
-    strncpy(body.magic, DATA_REQUEST_MAGIC, MAGIC_SIZE);
-    strncpy(body.device_id, robot->device_id, DEVICE_ID_SIZE - 1);
-    strncpy(body.serial_number, robot->serial_number, SERIAL_SIZE - 1);
+    copy_text(body.magic, MAGIC_SIZE, DATA_REQUEST_MAGIC);
+    copy_text(body.device_id, DEVICE_ID_SIZE, robot->device_id);
+    copy_text(body.serial_number, SERIAL_SIZE, robot->serial_number);
     body.request_sequence = session->next_request_sequence++;
     body.challenge_nonce = *challenge_out;
     body.timestamp = (uint64_t)time(NULL);
@@ -474,7 +517,7 @@ static int send_encrypted_data_request(
     unsigned long long encrypted_len = 0;
     memset(&packet, 0, sizeof(packet));
 
-    strncpy(packet.magic, ENCRYPTED_DATA_REQUEST_MAGIC, MAGIC_SIZE);
+    copy_text(packet.magic, MAGIC_SIZE, ENCRYPTED_DATA_REQUEST_MAGIC);
     randombytes_buf(packet.nonce, sizeof(packet.nonce));
 
     if (crypto_aead_xchacha20poly1305_ietf_encrypt(
@@ -679,7 +722,7 @@ int main() {
     DiscoveryRequestPacket discovery_request;
     memset(&discovery_request, 0, sizeof(discovery_request));
 
-    strncpy(discovery_request.magic, DISCOVERY_REQUEST_MAGIC, MAGIC_SIZE);
+    copy_text(discovery_request.magic, MAGIC_SIZE, DISCOVERY_REQUEST_MAGIC);
     discovery_request.challenge_nonce = discovery_challenge;
     discovery_request.timestamp = (uint64_t)time(NULL);
 
@@ -792,9 +835,24 @@ int main() {
 
         memset(&robots[robot_count], 0, sizeof(DiscoveredRobot));
 
-        strncpy(robots[robot_count].device_id, response.body.device_id, DEVICE_ID_SIZE - 1);
-        strncpy(robots[robot_count].serial_number, response.body.serial_number, SERIAL_SIZE - 1);
-        strncpy(robots[robot_count].ip_address, response.body.ip_address, IP_SIZE - 1);
+        copy_text_field(
+            robots[robot_count].device_id,
+            DEVICE_ID_SIZE,
+            response.body.device_id,
+            DEVICE_ID_SIZE
+        );
+        copy_text_field(
+            robots[robot_count].serial_number,
+            SERIAL_SIZE,
+            response.body.serial_number,
+            SERIAL_SIZE
+        );
+        copy_text_field(
+            robots[robot_count].ip_address,
+            IP_SIZE,
+            response.body.ip_address,
+            IP_SIZE
+        );
 
         robots[robot_count].service_port = response.body.service_port;
         memcpy(
@@ -861,8 +919,8 @@ int main() {
         TrustedRobot new_trusted_robot;
         memset(&new_trusted_robot, 0, sizeof(new_trusted_robot));
 
-        strncpy(new_trusted_robot.device_id, selected_robot.device_id, DEVICE_ID_SIZE - 1);
-        strncpy(new_trusted_robot.serial_number, selected_robot.serial_number, SERIAL_SIZE - 1);
+        copy_text(new_trusted_robot.device_id, DEVICE_ID_SIZE, selected_robot.device_id);
+        copy_text(new_trusted_robot.serial_number, SERIAL_SIZE, selected_robot.serial_number);
         memcpy(
             new_trusted_robot.public_key,
             selected_robot.public_key,
