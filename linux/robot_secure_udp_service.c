@@ -918,6 +918,42 @@ static int handle_file_metadata(
         return -1;
     }
 
+    if (transfer->active && transfer->transfer_id == meta->transfer_id) {
+        if (strncmp(transfer->file_name, meta->file_name, FILE_NAME_SIZE) == 0 &&
+            transfer->file_size == meta->file_size &&
+            transfer->chunk_size == meta->chunk_size &&
+            transfer->total_chunks == meta->total_chunks &&
+            sodium_memcmp(
+                transfer->expected_sha256,
+                meta->file_sha256,
+                crypto_hash_sha256_BYTES
+            ) == 0) {
+            send_meta_ack(
+                data_sock,
+                client_addr,
+                client_len,
+                session,
+                meta->transfer_id,
+                meta->sequence_number,
+                1,
+                "Accepted"
+            );
+            return 0;
+        }
+
+        send_meta_ack(
+            data_sock,
+            client_addr,
+            client_len,
+            session,
+            meta->transfer_id,
+            meta->sequence_number,
+            0,
+            "Conflicting duplicate metadata"
+        );
+        return -1;
+    }
+
     if (create_downloads_directory() != 0) {
         send_meta_ack(
             data_sock,

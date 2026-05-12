@@ -621,6 +621,18 @@ static int receive_encrypted_packet(
     );
 }
 
+static int file_plain_packet_type(const void *plain, size_t plain_len) {
+    uint32_t packet_type = 0;
+
+    if (plain_len < MAGIC_SIZE + sizeof(packet_type) ||
+        strncmp((const char *)plain, FILE_PACKET_MAGIC, MAGIC_SIZE) != 0) {
+        return -1;
+    }
+
+    memcpy(&packet_type, (const unsigned char *)plain + MAGIC_SIZE, sizeof(packet_type));
+    return (int)packet_type;
+}
+
 static int load_trusted_robots(
     TrustedRobot *trusted_robots,
     int max_count
@@ -1220,19 +1232,21 @@ static int send_file_metadata(
             continue;
         }
 
-        if (plain_len == sizeof(FileMetaAckPlain)) {
+        int packet_type = file_plain_packet_type(plain, plain_len);
+
+        if (packet_type == PACKET_TYPE_FILE_META_ACK &&
+            plain_len == sizeof(FileMetaAckPlain)) {
             FileMetaAckPlain *ack = (FileMetaAckPlain *)plain;
 
-            if (strncmp(ack->magic, FILE_PACKET_MAGIC, MAGIC_SIZE) == 0 &&
-                ack->packet_type == PACKET_TYPE_FILE_META_ACK &&
-                ack->transfer_id == transfer_id &&
+            if (ack->transfer_id == transfer_id &&
                 is_timestamp_fresh(ack->timestamp)) {
                 printf("File metadata ACK: %s\n", ack->message);
                 return ack->accepted ? 0 : -1;
             }
         }
 
-        if (plain_len == sizeof(FileTransferFailedPlain)) {
+        if (packet_type == PACKET_TYPE_FILE_TRANSFER_FAILED &&
+            plain_len == sizeof(FileTransferFailedPlain)) {
             FileTransferFailedPlain *failed = (FileTransferFailedPlain *)plain;
             printf("Robot rejected transfer: %s\n", failed->message);
             return -1;
@@ -1381,19 +1395,21 @@ static int send_file_chunks(
                 break;
             }
 
-            if (plain_len == sizeof(FileChunkAckPlain)) {
+            int packet_type = file_plain_packet_type(plain, plain_len);
+
+            if (packet_type == PACKET_TYPE_FILE_CHUNK_ACK &&
+                plain_len == sizeof(FileChunkAckPlain)) {
                 FileChunkAckPlain *ack = (FileChunkAckPlain *)plain;
 
-                if (strncmp(ack->magic, FILE_PACKET_MAGIC, MAGIC_SIZE) == 0 &&
-                    ack->packet_type == PACKET_TYPE_FILE_CHUNK_ACK &&
-                    ack->transfer_id == transfer_id &&
+                if (ack->transfer_id == transfer_id &&
                     ack->chunk_index < total_chunks &&
                     ack->status == 1 &&
                     !acked[ack->chunk_index]) {
                     acked[ack->chunk_index] = 1;
                     acked_count++;
                 }
-            } else if (plain_len == sizeof(FileStatusResponsePlain)) {
+            } else if (packet_type == PACKET_TYPE_FILE_STATUS_RESPONSE &&
+                       plain_len == sizeof(FileStatusResponsePlain)) {
                 FileStatusResponsePlain *status = (FileStatusResponsePlain *)plain;
                 printf(
                     "Robot status: %u/%u chunks received, missing listed=%u\n",
@@ -1401,7 +1417,8 @@ static int send_file_chunks(
                     status->total_chunks,
                     status->missing_count
                 );
-            } else if (plain_len == sizeof(FileTransferFailedPlain)) {
+            } else if (packet_type == PACKET_TYPE_FILE_TRANSFER_FAILED &&
+                       plain_len == sizeof(FileTransferFailedPlain)) {
                 FileTransferFailedPlain *failed = (FileTransferFailedPlain *)plain;
                 printf("Robot transfer failure: %s\n", failed->message);
                 free(acked);
@@ -1485,12 +1502,13 @@ static int handle_file_complete(
             continue;
         }
 
-        if (plain_len == sizeof(FileCompleteResponsePlain)) {
+        int packet_type = file_plain_packet_type(plain, plain_len);
+
+        if (packet_type == PACKET_TYPE_FILE_COMPLETE_RESPONSE &&
+            plain_len == sizeof(FileCompleteResponsePlain)) {
             FileCompleteResponsePlain *response = (FileCompleteResponsePlain *)plain;
 
-            if (strncmp(response->magic, FILE_PACKET_MAGIC, MAGIC_SIZE) == 0 &&
-                response->packet_type == PACKET_TYPE_FILE_COMPLETE_RESPONSE &&
-                response->transfer_id == transfer_id &&
+            if (response->transfer_id == transfer_id &&
                 is_timestamp_fresh(response->timestamp)) {
                 printf("Robot complete response: %s\n", response->message);
 
