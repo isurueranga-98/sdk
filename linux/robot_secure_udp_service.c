@@ -11,9 +11,7 @@
 #include <stdint.h>
 #include <unistd.h>
 #include <time.h>
-#include <fcntl.h>
 #include <errno.h>
-#include <sys/mman.h>
 #include <sys/stat.h>
 #include <arpa/inet.h>
 #include <sys/select.h>
@@ -24,14 +22,10 @@
 #define DISCOVERY_PORT 5005
 #define DATA_PORT 5006
 
-#define SHM_NAME "/robot_shared_memory"
-#define SHM_SIZE 1024
-
 #define MAGIC_SIZE 8
 #define DEVICE_ID_SIZE 32
 #define SERIAL_SIZE 32
 #define IP_SIZE 32
-#define MESSAGE_SIZE 256
 
 #define CHUNK_SIZE 1200
 #define WINDOW_SIZE 32
@@ -54,10 +48,6 @@
 #define DISCOVERY_RESPONSE_MAGIC "RRESPON"
 #define KX_REQUEST_MAGIC "RKXREQ"
 #define KX_RESPONSE_MAGIC "RKXRES"
-#define ENCRYPTED_DATA_REQUEST_MAGIC "RENCQ"
-#define ENCRYPTED_DATA_RESPONSE_MAGIC "RENCR"
-#define DATA_REQUEST_MAGIC "EDATAQ"
-#define DATA_RESPONSE_MAGIC "EDATAR"
 
 #define FRESHNESS_WINDOW_SECONDS 10
 
@@ -74,13 +64,6 @@ enum {
 };
 
 #pragma pack(push, 1)
-
-typedef struct {
-    int32_t counter;
-    float battery_level;
-    float temperature;
-    char message[MESSAGE_SIZE];
-} RobotSharedData;
 
 typedef struct {
     char magic[MAGIC_SIZE];
@@ -127,46 +110,6 @@ typedef struct {
     KeyExchangeResponseBody body;
     unsigned char signature[crypto_sign_BYTES];
 } KeyExchangeResponsePacket;
-
-typedef struct {
-    char magic[MAGIC_SIZE];
-    char device_id[DEVICE_ID_SIZE];
-    char serial_number[SERIAL_SIZE];
-    uint32_t request_sequence;
-    uint64_t challenge_nonce;
-    uint64_t timestamp;
-} EncryptedDataRequestBody;
-
-typedef struct {
-    char magic[MAGIC_SIZE];
-    unsigned char nonce[crypto_aead_xchacha20poly1305_ietf_NPUBBYTES];
-    unsigned char ciphertext[
-        sizeof(EncryptedDataRequestBody) +
-        crypto_aead_xchacha20poly1305_ietf_ABYTES
-    ];
-} EncryptedDataRequestPacket;
-
-typedef struct {
-    char magic[MAGIC_SIZE];
-    char device_id[DEVICE_ID_SIZE];
-    char serial_number[SERIAL_SIZE];
-    uint32_t response_sequence;
-    uint64_t challenge_nonce;
-    uint64_t timestamp;
-    int32_t counter;
-    float battery_level;
-    float temperature;
-    char message[MESSAGE_SIZE];
-} EncryptedDataResponseBody;
-
-typedef struct {
-    char magic[MAGIC_SIZE];
-    unsigned char nonce[crypto_aead_xchacha20poly1305_ietf_NPUBBYTES];
-    unsigned char ciphertext[
-        sizeof(EncryptedDataResponseBody) +
-        crypto_aead_xchacha20poly1305_ietf_ABYTES
-    ];
-} EncryptedDataResponsePacket;
 
 typedef struct {
     char magic[MAGIC_SIZE];
@@ -288,8 +231,6 @@ typedef struct {
     unsigned char server_kx_private_key[crypto_kx_SECRETKEYBYTES];
     unsigned char rx_key[crypto_kx_SESSIONKEYBYTES];
     unsigned char tx_key[crypto_kx_SESSIONKEYBYTES];
-    uint32_t last_request_sequence;
-    uint32_t next_response_sequence;
 } SecureSession;
 
 typedef struct {
@@ -794,8 +735,6 @@ static void handle_key_exchange_request(
 
     new_session.active = 1;
     new_session.client_addr = *client_addr;
-    new_session.last_request_sequence = 0;
-    new_session.next_response_sequence = 1;
 
     sodium_memzero(session, sizeof(*session));
     *session = new_session;
@@ -1392,132 +1331,9 @@ static void handle_file_packet(
     }
 }
 
-static void handle_encrypted_data_request(
-    int data_sock,
-    const RobotIdentity *identity,
-    const RobotSharedData *shared_data,
-    SecureSession *session,
-    const EncryptedDataRequestPacket *encrypted_request,
-    const struct sockaddr_in *client_addr,
-    socklen_t client_len
-) {
-    if (!same_client(session, client_addr)) {
-        printf("Encrypted request without active session ignored\n");
-        return;
-    }
-
-    EncryptedDataRequestBody request_body;
-    unsigned long long decrypted_len = 0;
-
-    if (crypto_aead_xchacha20poly1305_ietf_decrypt(
-            (unsigned char *)&request_body,
-            &decrypted_len,
-            NULL,
-            encrypted_request->ciphertext,
-            sizeof(encrypted_request->ciphertext),
-            NULL,
-            0,
-            encrypted_request->nonce,
-            session->rx_key
-        ) != 0) {
-        printf("Encrypted request authentication failed\n");
-        return;
-    }
-
-    if (decrypted_len != sizeof(EncryptedDataRequestBody)) {
-        printf("Invalid encrypted request plaintext size\n");
-        return;
-    }
-
-    if (strncmp(request_body.magic, DATA_REQUEST_MAGIC, MAGIC_SIZE) != 0) {
-        printf("Invalid encrypted request magic\n");
-        return;
-    }
-
-    if (strncmp(request_body.device_id, identity->device_id, DEVICE_ID_SIZE) != 0 ||
-        strncmp(request_body.serial_number, identity->serial_number, SERIAL_SIZE) != 0) {
-        printf("Encrypted request identity mismatch ignored\n");
-        return;
-    }
-
-    if (!is_timestamp_fresh(request_body.timestamp)) {
-        printf("Old encrypted request ignored\n");
-        return;
-    }
-
-    if (request_body.request_sequence <= session->last_request_sequence) {
-        printf("Replayed encrypted request ignored\n");
-        return;
-    }
-
-    session->last_request_sequence = request_body.request_sequence;
-
-    EncryptedDataResponseBody response_body;
-    memset(&response_body, 0, sizeof(response_body));
-
-    strncpy(response_body.magic, DATA_RESPONSE_MAGIC, MAGIC_SIZE);
-    strncpy(response_body.device_id, identity->device_id, DEVICE_ID_SIZE - 1);
-    strncpy(response_body.serial_number, identity->serial_number, SERIAL_SIZE - 1);
-    response_body.response_sequence = session->next_response_sequence++;
-    response_body.challenge_nonce = request_body.challenge_nonce;
-    response_body.timestamp = (uint64_t)time(NULL);
-    response_body.counter = shared_data->counter;
-    response_body.battery_level = shared_data->battery_level;
-    response_body.temperature = shared_data->temperature;
-    strncpy(response_body.message, shared_data->message, MESSAGE_SIZE - 1);
-
-    EncryptedDataResponsePacket encrypted_response;
-    unsigned long long encrypted_len = 0;
-    memset(&encrypted_response, 0, sizeof(encrypted_response));
-
-    strncpy(encrypted_response.magic, ENCRYPTED_DATA_RESPONSE_MAGIC, MAGIC_SIZE);
-    randombytes_buf(
-        encrypted_response.nonce,
-        sizeof(encrypted_response.nonce)
-    );
-
-    if (crypto_aead_xchacha20poly1305_ietf_encrypt(
-            encrypted_response.ciphertext,
-            &encrypted_len,
-            (unsigned char *)&response_body,
-            sizeof(response_body),
-            NULL,
-            0,
-            NULL,
-            encrypted_response.nonce,
-            session->tx_key
-        ) != 0) {
-        printf("Encrypted response creation failed\n");
-        return;
-    }
-
-    if (encrypted_len != sizeof(encrypted_response.ciphertext)) {
-        printf("Unexpected encrypted response length\n");
-        return;
-    }
-
-    sendto(
-        data_sock,
-        &encrypted_response,
-        sizeof(encrypted_response),
-        0,
-        (const struct sockaddr *)client_addr,
-        client_len
-    );
-
-    printf(
-        "Encrypted data sent | seq=%u counter=%d battery=%.2f temp=%.2f\n",
-        response_body.response_sequence,
-        response_body.counter,
-        response_body.battery_level,
-        response_body.temperature
-    );
-}
-
 static void handle_data_socket(
     int data_sock,
     const RobotIdentity *identity,
-    const RobotSharedData *shared_data,
     SecureSession *session,
     FileTransferState *transfer
 ) {
@@ -1557,24 +1373,6 @@ static void handle_data_socket(
         return;
     }
 
-    if (strncmp((char *)buffer, ENCRYPTED_DATA_REQUEST_MAGIC, MAGIC_SIZE) == 0) {
-        if (received != sizeof(EncryptedDataRequestPacket)) {
-            printf("Invalid encrypted request size\n");
-            return;
-        }
-
-        handle_encrypted_data_request(
-            data_sock,
-            identity,
-            shared_data,
-            session,
-            (EncryptedDataRequestPacket *)buffer,
-            &client_addr,
-            client_len
-        );
-        return;
-    }
-
     if (strncmp((char *)buffer, FILE_PACKET_MAGIC, MAGIC_SIZE) == 0) {
         handle_file_packet(
             data_sock,
@@ -1603,35 +1401,11 @@ int main() {
         return 1;
     }
 
-    int shm_fd = shm_open(SHM_NAME, O_RDWR, 0666);
-
-    if (shm_fd == -1) {
-        perror("shm_open failed. Run shm_writer first");
-        return 1;
-    }
-
-    RobotSharedData *shared_data = mmap(
-        NULL,
-        SHM_SIZE,
-        PROT_READ,
-        MAP_SHARED,
-        shm_fd,
-        0
-    );
-
-    if (shared_data == MAP_FAILED) {
-        perror("mmap failed");
-        close(shm_fd);
-        return 1;
-    }
-
     int discovery_sock = socket(AF_INET, SOCK_DGRAM, 0);
     int data_sock = socket(AF_INET, SOCK_DGRAM, 0);
 
     if (discovery_sock < 0 || data_sock < 0) {
         perror("socket failed");
-        munmap(shared_data, SHM_SIZE);
-        close(shm_fd);
         return 1;
     }
 
@@ -1654,8 +1428,6 @@ int main() {
         perror("discovery bind failed");
         close(discovery_sock);
         close(data_sock);
-        munmap(shared_data, SHM_SIZE);
-        close(shm_fd);
         return 1;
     }
 
@@ -1670,8 +1442,6 @@ int main() {
         perror("data bind failed");
         close(discovery_sock);
         close(data_sock);
-        munmap(shared_data, SHM_SIZE);
-        close(shm_fd);
         return 1;
     }
 
@@ -1707,7 +1477,7 @@ int main() {
         }
 
         if (FD_ISSET(data_sock, &read_fds)) {
-            handle_data_socket(data_sock, &identity, shared_data, &session, &transfer);
+            handle_data_socket(data_sock, &identity, &session, &transfer);
         }
     }
 
@@ -1715,8 +1485,6 @@ int main() {
     sodium_memzero(&session, sizeof(session));
     close(discovery_sock);
     close(data_sock);
-    munmap(shared_data, SHM_SIZE);
-    close(shm_fd);
 
     return 0;
 }
