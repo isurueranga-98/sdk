@@ -34,8 +34,8 @@
 #define MESSAGE_SIZE 256
 
 #define CHUNK_SIZE 1200
-#define WINDOW_SIZE 16
-#define ACK_TIMEOUT_MS 500
+#define WINDOW_SIZE 64
+#define ACK_TIMEOUT_MS 20
 #define MAX_RETRIES 20
 #define MAX_FILE_SIZE (100ULL * 1024ULL * 1024ULL)
 #define DOWNLOAD_DIR "downloads"
