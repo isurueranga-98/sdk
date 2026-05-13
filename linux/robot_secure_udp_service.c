@@ -667,6 +667,55 @@ static void handle_key_exchange_request(
         return;
     }
 
+    if (same_client(session, client_addr) &&
+        sodium_memcmp(
+            session->client_kx_public_key,
+            request->client_kx_public_key,
+            crypto_kx_PUBLICKEYBYTES
+        ) == 0) {
+        KeyExchangeResponsePacket response;
+        memset(&response, 0, sizeof(response));
+
+        strncpy(response.body.magic, KX_RESPONSE_MAGIC, MAGIC_SIZE);
+        strncpy(response.body.device_id, identity->device_id, DEVICE_ID_SIZE - 1);
+        strncpy(response.body.serial_number, identity->serial_number, SERIAL_SIZE - 1);
+        memcpy(
+            response.body.client_kx_public_key,
+            request->client_kx_public_key,
+            crypto_kx_PUBLICKEYBYTES
+        );
+        memcpy(
+            response.body.server_kx_public_key,
+            session->server_kx_public_key,
+            crypto_kx_PUBLICKEYBYTES
+        );
+        response.body.challenge_nonce = request->challenge_nonce;
+        response.body.timestamp = (uint64_t)time(NULL);
+
+        crypto_sign_detached(
+            response.signature,
+            NULL,
+            (unsigned char *)&response.body,
+            sizeof(KeyExchangeResponseBody),
+            identity->private_key
+        );
+
+        if (sendto(
+                data_sock,
+                &response,
+                sizeof(response),
+                0,
+                (const struct sockaddr *)client_addr,
+                client_len
+            ) < 0) {
+            perror("duplicate key exchange response send failed");
+        } else {
+            printf("Duplicate key exchange response resent to %s\n", inet_ntoa(client_addr->sin_addr));
+        }
+
+        return;
+    }
+
     SecureSession new_session;
     memset(&new_session, 0, sizeof(new_session));
 

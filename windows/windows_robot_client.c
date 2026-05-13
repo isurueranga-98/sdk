@@ -36,6 +36,9 @@
 #define MAX_TRUSTED_ROBOTS 50
 #define DISCOVERY_SEND_ROUNDS 3
 #define DISCOVERY_ROUND_DELAY_MS 250
+#define DISCOVERY_ATTEMPTS 5
+#define KEY_EXCHANGE_RETRIES 8
+#define KEY_EXCHANGE_RETRY_DELAY_MS 250
 
 #define CHUNK_SIZE 1200
 #define WINDOW_SIZE 32
@@ -876,82 +879,95 @@ static int perform_key_exchange(
     request.challenge_nonce = kx_challenge;
     request.timestamp = (uint64_t)time(NULL);
 
-    int sent = sendto(
-        data_sock,
-        (const char *)&request,
-        sizeof(request),
-        0,
-        (const struct sockaddr *)robot_data_addr,
-        sizeof(*robot_data_addr)
-    );
-
-    if (sent == SOCKET_ERROR) {
-        printf("Key exchange request failed: %d\n", WSAGetLastError());
-        return -1;
-    }
-
     KeyExchangeResponsePacket response;
-    struct sockaddr_in sender_addr;
-    int sender_len = sizeof(sender_addr);
+    int got_valid_response = 0;
 
-    int received = recvfrom(
-        data_sock,
-        (char *)&response,
-        sizeof(response),
-        0,
-        (struct sockaddr *)&sender_addr,
-        &sender_len
-    );
+    for (int attempt = 1; attempt <= KEY_EXCHANGE_RETRIES && !got_valid_response; attempt++) {
+        request.timestamp = (uint64_t)time(NULL);
 
-    if (received == SOCKET_ERROR) {
+        int sent = sendto(
+            data_sock,
+            (const char *)&request,
+            sizeof(request),
+            0,
+            (const struct sockaddr *)robot_data_addr,
+            sizeof(*robot_data_addr)
+        );
+
+        if (sent == SOCKET_ERROR) {
+            printf("Key exchange request failed: %d\n", WSAGetLastError());
+            return -1;
+        }
+
+        while (1) {
+            struct sockaddr_in sender_addr;
+            int sender_len = sizeof(sender_addr);
+
+            int received = recvfrom(
+                data_sock,
+                (char *)&response,
+                sizeof(response),
+                0,
+                (struct sockaddr *)&sender_addr,
+                &sender_len
+            );
+
+            if (received == SOCKET_ERROR) {
+                break;
+            }
+
+            if (received != sizeof(KeyExchangeResponsePacket)) {
+                continue;
+            }
+
+            if (strncmp(response.body.magic, KX_RESPONSE_MAGIC, MAGIC_SIZE) != 0) {
+                continue;
+            }
+
+            if (strncmp(response.body.device_id, robot->device_id, DEVICE_ID_SIZE) != 0 ||
+                strncmp(response.body.serial_number, robot->serial_number, SERIAL_SIZE) != 0) {
+                continue;
+            }
+
+            if (response.body.challenge_nonce != kx_challenge) {
+                continue;
+            }
+
+            if (!is_timestamp_fresh(response.body.timestamp)) {
+                continue;
+            }
+
+            if (sodium_memcmp(
+                    response.body.client_kx_public_key,
+                    session->client_kx_public_key,
+                    crypto_kx_PUBLICKEYBYTES
+                ) != 0) {
+                continue;
+            }
+
+            int verify_result = crypto_sign_verify_detached(
+                response.signature,
+                (unsigned char *)&response.body,
+                sizeof(KeyExchangeResponseBody),
+                robot->public_key
+            );
+
+            if (verify_result != 0) {
+                continue;
+            }
+
+            got_valid_response = 1;
+            break;
+        }
+
+        if (!got_valid_response && attempt < KEY_EXCHANGE_RETRIES) {
+            printf("No key exchange response yet, retrying (%d/%d)...\n", attempt, KEY_EXCHANGE_RETRIES);
+            Sleep(KEY_EXCHANGE_RETRY_DELAY_MS);
+        }
+    }
+
+    if (!got_valid_response) {
         printf("No key exchange response received\n");
-        return -1;
-    }
-
-    if (received != sizeof(KeyExchangeResponsePacket)) {
-        printf("Invalid key exchange response size\n");
-        return -1;
-    }
-
-    if (strncmp(response.body.magic, KX_RESPONSE_MAGIC, MAGIC_SIZE) != 0) {
-        printf("Invalid key exchange response magic\n");
-        return -1;
-    }
-
-    if (strncmp(response.body.device_id, robot->device_id, DEVICE_ID_SIZE) != 0 ||
-        strncmp(response.body.serial_number, robot->serial_number, SERIAL_SIZE) != 0) {
-        printf("Key exchange identity mismatch\n");
-        return -1;
-    }
-
-    if (response.body.challenge_nonce != kx_challenge) {
-        printf("Key exchange challenge mismatch\n");
-        return -1;
-    }
-
-    if (!is_timestamp_fresh(response.body.timestamp)) {
-        printf("Old key exchange response ignored\n");
-        return -1;
-    }
-
-    if (sodium_memcmp(
-            response.body.client_kx_public_key,
-            session->client_kx_public_key,
-            crypto_kx_PUBLICKEYBYTES
-        ) != 0) {
-        printf("Key exchange client public key echo mismatch\n");
-        return -1;
-    }
-
-    int verify_result = crypto_sign_verify_detached(
-        response.signature,
-        (unsigned char *)&response.body,
-        sizeof(KeyExchangeResponseBody),
-        robot->public_key
-    );
-
-    if (verify_result != 0) {
-        printf("Invalid signed key exchange response\n");
         return -1;
     }
 
@@ -1475,7 +1491,7 @@ int main() {
         return 1;
     }
 
-    DWORD timeout_ms = 3000;
+    DWORD timeout_ms = 1000;
 
     setsockopt(
         discovery_sock,
@@ -1495,150 +1511,163 @@ int main() {
     discovery_request.challenge_nonce = discovery_challenge;
     discovery_request.timestamp = (uint64_t)time(NULL);
 
-    printf("\nSending robot discovery broadcast...\n");
-
-    int sent = send_discovery_requests(
-        discovery_sock,
-        &discovery_request
-    );
-
-    if (sent == 0) {
-        printf("Discovery send failed: %d\n", WSAGetLastError());
-        closesocket(discovery_sock);
-        WSACleanup();
-        return 1;
-    }
-
     DiscoveredRobot robots[MAX_ROBOTS];
     int robot_count = 0;
 
+    printf("\nSending robot discovery broadcast...\n");
     printf("Waiting for robot responses...\n\n");
 
-    while (robot_count < MAX_ROBOTS) {
-        DiscoveryResponsePacket response;
-        struct sockaddr_in sender_addr;
-        int sender_len = sizeof(sender_addr);
+    for (int attempt = 1;
+         attempt <= DISCOVERY_ATTEMPTS && robot_count < MAX_ROBOTS;
+         attempt++) {
+        discovery_request.timestamp = (uint64_t)time(NULL);
 
-        int received = recvfrom(
+        int sent = send_discovery_requests(
             discovery_sock,
-            (char *)&response,
-            sizeof(response),
-            0,
-            (struct sockaddr *)&sender_addr,
-            &sender_len
+            &discovery_request
         );
 
-        if (received == SOCKET_ERROR) {
+        if (sent == 0) {
+            printf("Discovery send failed: %d\n", WSAGetLastError());
+            closesocket(discovery_sock);
+            WSACleanup();
+            return 1;
+        }
+
+        while (robot_count < MAX_ROBOTS) {
+            DiscoveryResponsePacket response;
+            struct sockaddr_in sender_addr;
+            int sender_len = sizeof(sender_addr);
+
+            int received = recvfrom(
+                discovery_sock,
+                (char *)&response,
+                sizeof(response),
+                0,
+                (struct sockaddr *)&sender_addr,
+                &sender_len
+            );
+
+            if (received == SOCKET_ERROR) {
+                break;
+            }
+
+            if (received != sizeof(DiscoveryResponsePacket)) {
+                printf("Invalid discovery response size ignored\n");
+                continue;
+            }
+
+            if (strncmp(response.body.magic, DISCOVERY_RESPONSE_MAGIC, MAGIC_SIZE) != 0) {
+                printf("Invalid discovery response magic ignored\n");
+                continue;
+            }
+
+            if (response.body.challenge_nonce != discovery_challenge) {
+                printf("Discovery challenge mismatch ignored\n");
+                continue;
+            }
+
+            if (!is_timestamp_fresh(response.body.timestamp)) {
+                printf("Old discovery response ignored\n");
+                continue;
+            }
+
+            int self_signature_ok = crypto_sign_verify_detached(
+                response.signature,
+                (unsigned char *)&response.body,
+                sizeof(DiscoveryResponseBody),
+                response.body.public_key
+            );
+
+            if (self_signature_ok != 0) {
+                printf("Robot self-signature invalid. Ignored.\n");
+                continue;
+            }
+
+            int trusted_index = find_trusted_robot(
+                trusted_robots,
+                trusted_count,
+                response.body.device_id,
+                response.body.serial_number
+            );
+
+            int trusted = 0;
+
+            if (trusted_index >= 0) {
+                if (is_same_public_key(
+                        trusted_robots[trusted_index].public_key,
+                        response.body.public_key
+                    )) {
+                    trusted = 1;
+                } else {
+                    printf(
+                        "WARNING: Robot %s / %s has different public key. Possible spoofing. Ignored.\n",
+                        response.body.device_id,
+                        response.body.serial_number
+                    );
+                    continue;
+                }
+            }
+
+            if (is_duplicate_robot(
+                    robots,
+                    robot_count,
+                    response.body.device_id,
+                    response.body.serial_number
+                )) {
+                continue;
+            }
+
+            memset(&robots[robot_count], 0, sizeof(DiscoveredRobot));
+
+            copy_text_field(
+                robots[robot_count].device_id,
+                DEVICE_ID_SIZE,
+                response.body.device_id,
+                DEVICE_ID_SIZE
+            );
+            copy_text_field(
+                robots[robot_count].serial_number,
+                SERIAL_SIZE,
+                response.body.serial_number,
+                SERIAL_SIZE
+            );
+            copy_text_field(
+                robots[robot_count].ip_address,
+                IP_SIZE,
+                response.body.ip_address,
+                IP_SIZE
+            );
+
+            robots[robot_count].service_port = response.body.service_port;
+            memcpy(
+                robots[robot_count].public_key,
+                response.body.public_key,
+                crypto_sign_PUBLICKEYBYTES
+            );
+
+            robots[robot_count].trusted = trusted;
+
+            printf(
+                "[%d] %s | %s | %s:%d | %s\n",
+                robot_count + 1,
+                robots[robot_count].device_id,
+                robots[robot_count].serial_number,
+                robots[robot_count].ip_address,
+                robots[robot_count].service_port,
+                trusted ? "TRUSTED" : "NEW / UNPAIRED"
+            );
+
+            robot_count++;
+        }
+
+        if (robot_count > 0) {
             break;
         }
 
-        if (received != sizeof(DiscoveryResponsePacket)) {
-            printf("Invalid discovery response size ignored\n");
-            continue;
+        if (attempt < DISCOVERY_ATTEMPTS) {
+            printf("No discovery response yet, retrying (%d/%d)...\n", attempt, DISCOVERY_ATTEMPTS);
         }
-
-        if (strncmp(response.body.magic, DISCOVERY_RESPONSE_MAGIC, MAGIC_SIZE) != 0) {
-            printf("Invalid discovery response magic ignored\n");
-            continue;
-        }
-
-        if (response.body.challenge_nonce != discovery_challenge) {
-            printf("Discovery challenge mismatch ignored\n");
-            continue;
-        }
-
-        if (!is_timestamp_fresh(response.body.timestamp)) {
-            printf("Old discovery response ignored\n");
-            continue;
-        }
-
-        int self_signature_ok = crypto_sign_verify_detached(
-            response.signature,
-            (unsigned char *)&response.body,
-            sizeof(DiscoveryResponseBody),
-            response.body.public_key
-        );
-
-        if (self_signature_ok != 0) {
-            printf("Robot self-signature invalid. Ignored.\n");
-            continue;
-        }
-
-        int trusted_index = find_trusted_robot(
-            trusted_robots,
-            trusted_count,
-            response.body.device_id,
-            response.body.serial_number
-        );
-
-        int trusted = 0;
-
-        if (trusted_index >= 0) {
-            if (is_same_public_key(
-                    trusted_robots[trusted_index].public_key,
-                    response.body.public_key
-                )) {
-                trusted = 1;
-            } else {
-                printf(
-                    "WARNING: Robot %s / %s has different public key. Possible spoofing. Ignored.\n",
-                    response.body.device_id,
-                    response.body.serial_number
-                );
-                continue;
-            }
-        }
-
-        if (is_duplicate_robot(
-                robots,
-                robot_count,
-                response.body.device_id,
-                response.body.serial_number
-            )) {
-            continue;
-        }
-
-        memset(&robots[robot_count], 0, sizeof(DiscoveredRobot));
-
-        copy_text_field(
-            robots[robot_count].device_id,
-            DEVICE_ID_SIZE,
-            response.body.device_id,
-            DEVICE_ID_SIZE
-        );
-        copy_text_field(
-            robots[robot_count].serial_number,
-            SERIAL_SIZE,
-            response.body.serial_number,
-            SERIAL_SIZE
-        );
-        copy_text_field(
-            robots[robot_count].ip_address,
-            IP_SIZE,
-            response.body.ip_address,
-            IP_SIZE
-        );
-
-        robots[robot_count].service_port = response.body.service_port;
-        memcpy(
-            robots[robot_count].public_key,
-            response.body.public_key,
-            crypto_sign_PUBLICKEYBYTES
-        );
-
-        robots[robot_count].trusted = trusted;
-
-        printf(
-            "[%d] %s | %s | %s:%d | %s\n",
-            robot_count + 1,
-            robots[robot_count].device_id,
-            robots[robot_count].serial_number,
-            robots[robot_count].ip_address,
-            robots[robot_count].service_port,
-            trusted ? "TRUSTED" : "NEW / UNPAIRED"
-        );
-
-        robot_count++;
     }
 
     if (robot_count == 0) {
