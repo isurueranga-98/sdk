@@ -241,6 +241,7 @@ typedef struct {
     uint16_t service_port;
     unsigned char public_key[crypto_sign_PUBLICKEYBYTES];
     int trusted;
+    int key_changed;
 } DiscoveredRobot;
 
 typedef struct {
@@ -658,6 +659,39 @@ static int save_trusted_robot(const TrustedRobot *robot) {
         robot->serial_number,
         public_key_hex
     );
+
+    fclose(file);
+    return 0;
+}
+
+static int rewrite_trusted_robots(
+    TrustedRobot *trusted_robots,
+    int trusted_count
+) {
+    FILE *file = fopen(TRUSTED_FILE, "w");
+
+    if (file == NULL) {
+        perror("Failed to rewrite trusted_robots.txt");
+        return -1;
+    }
+
+    for (int i = 0; i < trusted_count; i++) {
+        char public_key_hex[crypto_sign_PUBLICKEYBYTES * 2 + 1];
+
+        public_key_to_hex(
+            trusted_robots[i].public_key,
+            public_key_hex,
+            sizeof(public_key_hex)
+        );
+
+        fprintf(
+            file,
+            "%s|%s|%s\n",
+            trusted_robots[i].device_id,
+            trusted_robots[i].serial_number,
+            public_key_hex
+        );
+    }
 
     fclose(file);
     return 0;
@@ -1592,6 +1626,7 @@ int main() {
             );
 
             int trusted = 0;
+            int key_changed = 0;
 
             if (trusted_index >= 0) {
                 if (is_same_public_key(
@@ -1600,12 +1635,12 @@ int main() {
                     )) {
                     trusted = 1;
                 } else {
+                    key_changed = 1;
                     printf(
-                        "WARNING: Robot %s / %s has different public key. Possible spoofing. Ignored.\n",
+                        "WARNING: Robot %s / %s has different public key. Marked KEY CHANGED.\n",
                         response.body.device_id,
                         response.body.serial_number
                     );
-                    continue;
                 }
             }
 
@@ -1647,6 +1682,7 @@ int main() {
             );
 
             robots[robot_count].trusted = trusted;
+            robots[robot_count].key_changed = key_changed;
 
             printf(
                 "[%d] %s | %s | %s:%d | %s\n",
@@ -1655,7 +1691,7 @@ int main() {
                 robots[robot_count].serial_number,
                 robots[robot_count].ip_address,
                 robots[robot_count].service_port,
-                trusted ? "TRUSTED" : "NEW / UNPAIRED"
+                key_changed ? "KEY CHANGED" : (trusted ? "TRUSTED" : "NEW / UNPAIRED")
             );
 
             robot_count++;
@@ -1690,6 +1726,59 @@ int main() {
     }
 
     DiscoveredRobot selected_robot = robots[selected - 1];
+
+    if (selected_robot.key_changed) {
+        char answer[16];
+
+        printf("\nWARNING: This robot identity matches a trusted robot, but its public key changed.\n");
+        printf("This can happen if robot_identity_setup was run again, or it can indicate spoofing.\n");
+        printf("Device ID     : %s\n", selected_robot.device_id);
+        printf("Serial Number : %s\n", selected_robot.serial_number);
+        printf("IP Address    : %s\n", selected_robot.ip_address);
+        printf("Port          : %d\n", selected_robot.service_port);
+
+        printf("\nOnly continue if you physically control this robot. Type replace to update trusted key: ");
+        scanf("%15s", answer);
+
+        if (strcmp(answer, "replace") != 0) {
+            printf("Key replacement cancelled.\n");
+            closesocket(discovery_sock);
+            WSACleanup();
+            return 1;
+        }
+
+        int replace_index = find_trusted_robot(
+            trusted_robots,
+            trusted_count,
+            selected_robot.device_id,
+            selected_robot.serial_number
+        );
+
+        if (replace_index < 0) {
+            printf("Trusted robot entry not found.\n");
+            closesocket(discovery_sock);
+            WSACleanup();
+            return 1;
+        }
+
+        memcpy(
+            trusted_robots[replace_index].public_key,
+            selected_robot.public_key,
+            crypto_sign_PUBLICKEYBYTES
+        );
+
+        if (rewrite_trusted_robots(trusted_robots, trusted_count) != 0) {
+            printf("Failed to update trusted robot key.\n");
+            closesocket(discovery_sock);
+            WSACleanup();
+            return 1;
+        }
+
+        selected_robot.trusted = 1;
+        selected_robot.key_changed = 0;
+
+        printf("Trusted robot key replaced successfully.\n");
+    }
 
     if (!selected_robot.trusted) {
         char answer[16];
