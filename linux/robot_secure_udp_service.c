@@ -34,9 +34,10 @@
 #define MESSAGE_SIZE 256
 
 #define CHUNK_SIZE 1200
-#define WINDOW_SIZE 64
-#define ACK_TIMEOUT_MS 20
-#define MAX_RETRIES 20
+#define WINDOW_SIZE 32
+#define ACK_TIMEOUT_MS 100
+#define MAX_RETRIES 200
+#define UDP_BUFFER_SIZE (4 * 1024 * 1024)
 #define MAX_FILE_SIZE (100ULL * 1024ULL * 1024ULL)
 #define DOWNLOAD_DIR "downloads"
 #define FILE_NAME_SIZE 128
@@ -1635,8 +1636,12 @@ int main() {
     }
 
     int reuse = 1;
+    int udp_buffer_size = UDP_BUFFER_SIZE;
+
     setsockopt(discovery_sock, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
     setsockopt(data_sock, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+    setsockopt(data_sock, SOL_SOCKET, SO_RCVBUF, &udp_buffer_size, sizeof(udp_buffer_size));
+    setsockopt(data_sock, SOL_SOCKET, SO_SNDBUF, &udp_buffer_size, sizeof(udp_buffer_size));
 
     struct sockaddr_in discovery_addr;
     memset(&discovery_addr, 0, sizeof(discovery_addr));

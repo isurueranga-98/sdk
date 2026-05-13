@@ -39,9 +39,10 @@
 #define DISCOVERY_ROUND_DELAY_MS 250
 
 #define CHUNK_SIZE 1200
-#define WINDOW_SIZE 64
-#define ACK_TIMEOUT_MS 20
-#define MAX_RETRIES 20
+#define WINDOW_SIZE 32
+#define ACK_TIMEOUT_MS 100
+#define MAX_RETRIES 200
+#define UDP_BUFFER_SIZE (4 * 1024 * 1024)
 #define MAX_FILE_SIZE (100ULL * 1024ULL * 1024ULL)
 #define FILE_NAME_SIZE 128
 #define FILE_PATH_SIZE 256
@@ -1888,6 +1889,23 @@ int main() {
         WSACleanup();
         return 1;
     }
+
+    int udp_buffer_size = UDP_BUFFER_SIZE;
+
+    setsockopt(
+        data_sock,
+        SOL_SOCKET,
+        SO_RCVBUF,
+        (char *)&udp_buffer_size,
+        sizeof(udp_buffer_size)
+    );
+    setsockopt(
+        data_sock,
+        SOL_SOCKET,
+        SO_SNDBUF,
+        (char *)&udp_buffer_size,
+        sizeof(udp_buffer_size)
+    );
 
     setsockopt(
         data_sock,
