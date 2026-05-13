@@ -48,7 +48,7 @@
 #define FILE_PATH_SIZE 256
 #define FILE_MESSAGE_SIZE 128
 #define ACK_MESSAGE_SIZE 64
-#define MAX_MISSING_LIST 64
+#define MAX_MISSING_LIST 256
 #define FILE_PACKET_MAGIC "RFILE"
 #define MAX_FILE_PLAINTEXT_SIZE 1400
 #define MAX_FILE_CIPHERTEXT_SIZE \
@@ -1382,7 +1382,9 @@ static int send_file_chunks(
             }
         }
 
-        for (uint32_t i = 0; i < sent_this_round + WINDOW_SIZE; i++) {
+        uint32_t receive_budget = sent_this_round + WINDOW_SIZE;
+
+        for (uint32_t i = 0; i < receive_budget; i++) {
             unsigned char plain[MAX_FILE_PLAINTEXT_SIZE];
             size_t plain_len = 0;
 
@@ -1412,12 +1414,49 @@ static int send_file_chunks(
             } else if (packet_type == PACKET_TYPE_FILE_STATUS_RESPONSE &&
                        plain_len == sizeof(FileStatusResponsePlain)) {
                 FileStatusResponsePlain *status = (FileStatusResponsePlain *)plain;
+                uint32_t resent_missing = 0;
+
                 printf(
                     "Robot status: %u/%u chunks received, missing listed=%u\n",
                     status->received_chunks,
                     status->total_chunks,
                     status->missing_count
                 );
+
+                if (status->transfer_id == transfer_id &&
+                    status->total_chunks == total_chunks) {
+                    uint32_t missing_count = status->missing_count;
+
+                    if (missing_count > MAX_MISSING_LIST) {
+                        missing_count = MAX_MISSING_LIST;
+                    }
+
+                    for (uint32_t missing = 0; missing < missing_count; missing++) {
+                        uint32_t chunk_index = status->missing_indices[missing];
+
+                        if (chunk_index < total_chunks && !acked[chunk_index]) {
+                            if (send_one_file_chunk(
+                                    data_sock,
+                                    robot_data_addr,
+                                    session,
+                                    file,
+                                    transfer_id,
+                                    chunk_index,
+                                    file_size
+                                ) == 0) {
+                                resent_missing++;
+                            }
+                        }
+                    }
+
+                    if (resent_missing > 0) {
+                        receive_budget += resent_missing;
+                        printf(
+                            "Retransmitted %u robot-reported missing chunks\n",
+                            resent_missing
+                        );
+                    }
+                }
             } else if (packet_type == PACKET_TYPE_FILE_TRANSFER_FAILED &&
                        plain_len == sizeof(FileTransferFailedPlain)) {
                 FileTransferFailedPlain *failed = (FileTransferFailedPlain *)plain;
