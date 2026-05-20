@@ -51,6 +51,9 @@
 #define FILE_MESSAGE_SIZE 128
 #define ACK_MESSAGE_SIZE 64
 #define MAX_MISSING_LIST 256
+#define MAX_TRANSFER_FILES 2
+#define FILE_TYPE_ONNX 1
+#define FILE_TYPE_YAML 2
 #define FILE_PACKET_MAGIC "RFILE"
 #define MAX_FILE_PLAINTEXT_SIZE 1400
 #define MAX_FILE_CIPHERTEXT_SIZE \
@@ -72,7 +75,13 @@ enum {
     PACKET_TYPE_FILE_STATUS_RESPONSE = 6,
     PACKET_TYPE_FILE_COMPLETE_REQUEST = 7,
     PACKET_TYPE_FILE_COMPLETE_RESPONSE = 8,
-    PACKET_TYPE_FILE_TRANSFER_FAILED = 9
+    PACKET_TYPE_FILE_TRANSFER_FAILED = 9,
+    PACKET_TYPE_SESSION_START = 10,
+    PACKET_TYPE_SESSION_METADATA = 11,
+    PACKET_TYPE_FILE_START = 12,
+    PACKET_TYPE_FILE_COMPLETE = 13,
+    PACKET_TYPE_SESSION_COMPLETE = 14,
+    PACKET_TYPE_SESSION_ERROR = 15
 };
 
 #pragma pack(push, 1)
@@ -137,6 +146,55 @@ typedef struct {
 } FileMetaPlain;
 
 typedef struct {
+    uint32_t file_index;
+    uint32_t file_type;
+    char file_name[FILE_NAME_SIZE];
+    uint64_t file_size;
+    uint32_t chunk_size;
+    uint32_t total_chunks;
+    unsigned char file_sha256[crypto_hash_sha256_BYTES];
+} SessionFileInfoPlain;
+
+typedef struct {
+    char magic[MAGIC_SIZE];
+    uint32_t packet_type;
+    uint64_t transfer_id;
+    uint32_t sequence_number;
+    uint64_t timestamp;
+    uint32_t file_count;
+} SessionStartPlain;
+
+typedef struct {
+    char magic[MAGIC_SIZE];
+    uint32_t packet_type;
+    uint64_t transfer_id;
+    uint32_t sequence_number;
+    uint64_t timestamp;
+    char robot_id[DEVICE_ID_SIZE];
+    uint32_t file_count;
+    SessionFileInfoPlain files[MAX_TRANSFER_FILES];
+} SessionMetadataPlain;
+
+typedef struct {
+    char magic[MAGIC_SIZE];
+    uint32_t packet_type;
+    uint64_t transfer_id;
+    uint32_t sequence_number;
+    uint64_t timestamp;
+    int32_t accepted;
+    char message[FILE_MESSAGE_SIZE];
+} FileControlAckPlain;
+
+typedef struct {
+    char magic[MAGIC_SIZE];
+    uint32_t packet_type;
+    uint64_t transfer_id;
+    uint32_t sequence_number;
+    uint64_t timestamp;
+    uint32_t file_index;
+} FileStartPlain;
+
+typedef struct {
     char magic[MAGIC_SIZE];
     uint32_t packet_type;
     uint64_t transfer_id;
@@ -152,6 +210,7 @@ typedef struct {
     uint64_t transfer_id;
     uint32_t sequence_number;
     uint64_t timestamp;
+    uint32_t file_index;
     uint32_t chunk_index;
     uint32_t chunk_size;
     uint64_t offset;
@@ -164,6 +223,7 @@ typedef struct {
     uint64_t transfer_id;
     uint32_t sequence_number;
     uint64_t timestamp;
+    uint32_t file_index;
     uint32_t chunk_index;
     int32_t status;
     char message[ACK_MESSAGE_SIZE];
@@ -175,6 +235,7 @@ typedef struct {
     uint64_t transfer_id;
     uint32_t sequence_number;
     uint64_t timestamp;
+    uint32_t file_index;
 } FileStatusRequestPlain;
 
 typedef struct {
@@ -183,6 +244,7 @@ typedef struct {
     uint64_t transfer_id;
     uint32_t sequence_number;
     uint64_t timestamp;
+    uint32_t file_index;
     uint32_t total_chunks;
     uint32_t received_chunks;
     uint32_t missing_count;
@@ -195,6 +257,7 @@ typedef struct {
     uint64_t transfer_id;
     uint32_t sequence_number;
     uint64_t timestamp;
+    uint32_t file_index;
 } FileCompleteRequestPlain;
 
 typedef struct {
@@ -203,11 +266,21 @@ typedef struct {
     uint64_t transfer_id;
     uint32_t sequence_number;
     uint64_t timestamp;
+    uint32_t file_index;
     int32_t success;
     char final_file_path[FILE_PATH_SIZE];
     unsigned char computed_sha256[crypto_hash_sha256_BYTES];
     char message[FILE_MESSAGE_SIZE];
 } FileCompleteResponsePlain;
+
+typedef struct {
+    char magic[MAGIC_SIZE];
+    uint32_t packet_type;
+    uint64_t transfer_id;
+    uint32_t sequence_number;
+    uint64_t timestamp;
+    unsigned char session_sha256[crypto_hash_sha256_BYTES];
+} SessionCompletePlain;
 
 typedef struct {
     char magic[MAGIC_SIZE];
@@ -252,6 +325,16 @@ typedef struct {
     unsigned char tx_key[crypto_kx_SESSIONKEYBYTES];
     uint32_t next_request_sequence;
 } SecureSession;
+
+typedef struct {
+    const char *path;
+    char file_name[FILE_NAME_SIZE];
+    uint32_t file_index;
+    uint32_t file_type;
+    uint64_t file_size;
+    uint32_t total_chunks;
+    unsigned char file_sha256[crypto_hash_sha256_BYTES];
+} TransferFile;
 
 static void public_key_to_hex(
     const unsigned char *public_key,
@@ -353,6 +436,20 @@ static int has_onnx_extension(const char *path) {
     return _stricmp(path + length - 5, ".onnx") == 0;
 }
 
+static int has_yaml_extension(const char *path) {
+    size_t length = strlen(path);
+
+    if (length >= 5 && _stricmp(path + length - 5, ".yaml") == 0) {
+        return 1;
+    }
+
+    if (length >= 4 && _stricmp(path + length - 4, ".yml") == 0) {
+        return 1;
+    }
+
+    return 0;
+}
+
 static const char *base_name_from_path(const char *path) {
     const char *slash = strrchr(path, '/');
     const char *backslash = strrchr(path, '\\');
@@ -382,7 +479,7 @@ static int sanitize_filename(const char *file_name) {
         return 0;
     }
 
-    return has_onnx_extension(file_name);
+    return has_onnx_extension(file_name) || has_yaml_extension(file_name);
 }
 
 static int get_file_size(FILE *file, uint64_t *size_out) {
@@ -1100,11 +1197,180 @@ static int send_file_metadata(
     return -1;
 }
 
+static int wait_for_control_ack(
+    SOCKET data_sock,
+    SecureSession *session,
+    uint64_t transfer_id,
+    const char *timeout_message
+) {
+    unsigned char plain[MAX_FILE_PLAINTEXT_SIZE];
+    size_t plain_len = 0;
+
+    if (receive_encrypted_packet(
+            data_sock,
+            session,
+            plain,
+            sizeof(plain),
+            &plain_len
+        ) != 0) {
+        return -1;
+    }
+
+    int packet_type = file_plain_packet_type(plain, plain_len);
+
+    if ((packet_type == PACKET_TYPE_FILE_META_ACK ||
+         packet_type == PACKET_TYPE_SESSION_ERROR) &&
+        plain_len == sizeof(FileControlAckPlain)) {
+        FileControlAckPlain *ack = (FileControlAckPlain *)plain;
+
+        if (ack->transfer_id == transfer_id &&
+            is_timestamp_fresh(ack->timestamp)) {
+            printf("%s\n", ack->message);
+            return ack->accepted ? 0 : -1;
+        }
+    }
+
+    if (packet_type == PACKET_TYPE_FILE_TRANSFER_FAILED &&
+        plain_len == sizeof(FileTransferFailedPlain)) {
+        FileTransferFailedPlain *failed = (FileTransferFailedPlain *)plain;
+        printf("Robot rejected transfer: %s\n", failed->message);
+        return -1;
+    }
+
+    (void)timeout_message;
+    return -1;
+}
+
+static int send_session_start(
+    SOCKET data_sock,
+    const struct sockaddr_in *robot_data_addr,
+    SecureSession *session,
+    uint64_t transfer_id,
+    uint32_t file_count
+) {
+    SessionStartPlain start;
+    memset(&start, 0, sizeof(start));
+
+    copy_text(start.magic, MAGIC_SIZE, FILE_PACKET_MAGIC);
+    start.packet_type = PACKET_TYPE_SESSION_START;
+    start.transfer_id = transfer_id;
+    start.sequence_number = session->next_request_sequence++;
+    start.timestamp = (uint64_t)time(NULL);
+    start.file_count = file_count;
+
+    for (int retry = 0; retry < MAX_RETRIES; retry++) {
+        if (send_encrypted_packet(
+                data_sock,
+                robot_data_addr,
+                session,
+                &start,
+                sizeof(start)
+            ) != 0) {
+            return -1;
+        }
+
+        if (wait_for_control_ack(data_sock, session, transfer_id, "No session start ACK") == 0) {
+            return 0;
+        }
+    }
+
+    printf("No session start ACK received\n");
+    return -1;
+}
+
+static int send_session_metadata(
+    SOCKET data_sock,
+    const struct sockaddr_in *robot_data_addr,
+    SecureSession *session,
+    uint64_t transfer_id,
+    const char *robot_id,
+    const TransferFile *files,
+    uint32_t file_count
+) {
+    SessionMetadataPlain metadata;
+    memset(&metadata, 0, sizeof(metadata));
+
+    copy_text(metadata.magic, MAGIC_SIZE, FILE_PACKET_MAGIC);
+    metadata.packet_type = PACKET_TYPE_SESSION_METADATA;
+    metadata.transfer_id = transfer_id;
+    metadata.sequence_number = session->next_request_sequence++;
+    metadata.timestamp = (uint64_t)time(NULL);
+    copy_text(metadata.robot_id, sizeof(metadata.robot_id), robot_id);
+    metadata.file_count = file_count;
+
+    for (uint32_t i = 0; i < file_count; i++) {
+        metadata.files[i].file_index = files[i].file_index;
+        metadata.files[i].file_type = files[i].file_type;
+        copy_text(metadata.files[i].file_name, sizeof(metadata.files[i].file_name), files[i].file_name);
+        metadata.files[i].file_size = files[i].file_size;
+        metadata.files[i].chunk_size = CHUNK_SIZE;
+        metadata.files[i].total_chunks = files[i].total_chunks;
+        memcpy(metadata.files[i].file_sha256, files[i].file_sha256, crypto_hash_sha256_BYTES);
+    }
+
+    for (int retry = 0; retry < MAX_RETRIES; retry++) {
+        if (send_encrypted_packet(
+                data_sock,
+                robot_data_addr,
+                session,
+                &metadata,
+                sizeof(metadata)
+            ) != 0) {
+            return -1;
+        }
+
+        if (wait_for_control_ack(data_sock, session, transfer_id, "No session metadata ACK") == 0) {
+            return 0;
+        }
+    }
+
+    printf("No session metadata ACK received\n");
+    return -1;
+}
+
+static int send_file_start(
+    SOCKET data_sock,
+    const struct sockaddr_in *robot_data_addr,
+    SecureSession *session,
+    uint64_t transfer_id,
+    uint32_t file_index
+) {
+    FileStartPlain start;
+    memset(&start, 0, sizeof(start));
+
+    copy_text(start.magic, MAGIC_SIZE, FILE_PACKET_MAGIC);
+    start.packet_type = PACKET_TYPE_FILE_START;
+    start.transfer_id = transfer_id;
+    start.sequence_number = session->next_request_sequence++;
+    start.timestamp = (uint64_t)time(NULL);
+    start.file_index = file_index;
+
+    for (int retry = 0; retry < MAX_RETRIES; retry++) {
+        if (send_encrypted_packet(
+                data_sock,
+                robot_data_addr,
+                session,
+                &start,
+                sizeof(start)
+            ) != 0) {
+            return -1;
+        }
+
+        if (wait_for_control_ack(data_sock, session, transfer_id, "No file start ACK") == 0) {
+            return 0;
+        }
+    }
+
+    printf("No file start ACK received\n");
+    return -1;
+}
+
 static int send_file_status_request(
     SOCKET data_sock,
     const struct sockaddr_in *robot_data_addr,
     SecureSession *session,
-    uint64_t transfer_id
+    uint64_t transfer_id,
+    uint32_t file_index
 ) {
     FileStatusRequestPlain request;
     memset(&request, 0, sizeof(request));
@@ -1114,6 +1380,7 @@ static int send_file_status_request(
     request.transfer_id = transfer_id;
     request.sequence_number = session->next_request_sequence++;
     request.timestamp = (uint64_t)time(NULL);
+    request.file_index = file_index;
 
     return send_encrypted_packet(
         data_sock,
@@ -1130,6 +1397,7 @@ static int send_one_file_chunk(
     SecureSession *session,
     FILE *file,
     uint64_t transfer_id,
+    uint32_t file_index,
     uint32_t chunk_index,
     uint64_t file_size
 ) {
@@ -1151,6 +1419,7 @@ static int send_one_file_chunk(
     chunk.transfer_id = transfer_id;
     chunk.sequence_number = session->next_request_sequence++;
     chunk.timestamp = (uint64_t)time(NULL);
+    chunk.file_index = file_index;
     chunk.chunk_index = chunk_index;
     chunk.chunk_size = expected_size;
     chunk.offset = offset;
@@ -1178,6 +1447,7 @@ static int send_file_chunks(
     SecureSession *session,
     const char *file_path,
     uint64_t transfer_id,
+    uint32_t file_index,
     uint64_t file_size,
     uint32_t total_chunks
 ) {
@@ -1216,6 +1486,7 @@ static int send_file_chunks(
                         session,
                         file,
                         transfer_id,
+                        file_index,
                         i,
                         file_size
                     ) == 0) {
@@ -1247,6 +1518,7 @@ static int send_file_chunks(
                 FileChunkAckPlain *ack = (FileChunkAckPlain *)plain;
 
                 if (ack->transfer_id == transfer_id &&
+                    ack->file_index == file_index &&
                     ack->chunk_index < total_chunks &&
                     ack->status == 1 &&
                     !acked[ack->chunk_index]) {
@@ -1266,6 +1538,7 @@ static int send_file_chunks(
                 );
 
                 if (status->transfer_id == transfer_id &&
+                    status->file_index == file_index &&
                     status->total_chunks == total_chunks) {
                     uint32_t missing_count = status->missing_count;
 
@@ -1283,6 +1556,7 @@ static int send_file_chunks(
                                     session,
                                     file,
                                     transfer_id,
+                                    file_index,
                                     chunk_index,
                                     file_size
                                 ) == 0) {
@@ -1324,7 +1598,8 @@ static int send_file_chunks(
                 data_sock,
                 robot_data_addr,
                 session,
-                transfer_id
+                transfer_id,
+                file_index
             );
         }
 
@@ -1350,7 +1625,8 @@ static int handle_file_complete(
     SOCKET data_sock,
     const struct sockaddr_in *robot_data_addr,
     SecureSession *session,
-    uint64_t transfer_id
+    uint64_t transfer_id,
+    uint32_t file_index
 ) {
     FileCompleteRequestPlain request;
     unsigned char plain[MAX_FILE_PLAINTEXT_SIZE];
@@ -1358,10 +1634,11 @@ static int handle_file_complete(
 
     memset(&request, 0, sizeof(request));
     copy_text(request.magic, MAGIC_SIZE, FILE_PACKET_MAGIC);
-    request.packet_type = PACKET_TYPE_FILE_COMPLETE_REQUEST;
+    request.packet_type = PACKET_TYPE_FILE_COMPLETE;
     request.transfer_id = transfer_id;
     request.sequence_number = session->next_request_sequence++;
     request.timestamp = (uint64_t)time(NULL);
+    request.file_index = file_index;
 
     for (int retry = 0; retry < MAX_RETRIES; retry++) {
         if (send_encrypted_packet(
@@ -1391,6 +1668,7 @@ static int handle_file_complete(
             FileCompleteResponsePlain *response = (FileCompleteResponsePlain *)plain;
 
             if (response->transfer_id == transfer_id &&
+                response->file_index == file_index &&
                 is_timestamp_fresh(response->timestamp)) {
                 printf("Robot complete response: %s\n", response->message);
 
@@ -1408,44 +1686,234 @@ static int handle_file_complete(
     return -1;
 }
 
-static int transfer_onnx_file(
+static void compute_session_hash(
+    const TransferFile *files,
+    uint32_t file_count,
+    unsigned char session_hash[crypto_hash_sha256_BYTES]
+) {
+    crypto_hash_sha256_state state;
+
+    crypto_hash_sha256_init(&state);
+
+    for (uint32_t i = 0; i < file_count; i++) {
+        crypto_hash_sha256_update(&state, files[i].file_sha256, crypto_hash_sha256_BYTES);
+    }
+
+    crypto_hash_sha256_final(&state, session_hash);
+}
+
+static int send_session_complete(
     SOCKET data_sock,
     const struct sockaddr_in *robot_data_addr,
     SecureSession *session,
-    const char *file_path
+    uint64_t transfer_id,
+    const unsigned char session_hash[crypto_hash_sha256_BYTES]
 ) {
-    char file_name[FILE_NAME_SIZE];
-    const char *base_name = base_name_from_path(file_path);
-    uint64_t file_size = 0;
-    uint32_t total_chunks = 0;
-    uint64_t transfer_id = 0;
-    unsigned char file_hash[crypto_hash_sha256_BYTES];
+    SessionCompletePlain complete;
+    memset(&complete, 0, sizeof(complete));
 
-    if (!has_onnx_extension(file_path) || !sanitize_filename(base_name)) {
-        printf("Only safe .onnx file names are allowed\n");
+    copy_text(complete.magic, MAGIC_SIZE, FILE_PACKET_MAGIC);
+    complete.packet_type = PACKET_TYPE_SESSION_COMPLETE;
+    complete.transfer_id = transfer_id;
+    complete.sequence_number = session->next_request_sequence++;
+    complete.timestamp = (uint64_t)time(NULL);
+    memcpy(complete.session_sha256, session_hash, crypto_hash_sha256_BYTES);
+
+    for (int retry = 0; retry < MAX_RETRIES; retry++) {
+        if (send_encrypted_packet(
+                data_sock,
+                robot_data_addr,
+                session,
+                &complete,
+                sizeof(complete)
+            ) != 0) {
+            return -1;
+        }
+
+        if (wait_for_control_ack(data_sock, session, transfer_id, "No session complete ACK") == 0) {
+            return 0;
+        }
+    }
+
+    printf("No session complete ACK received\n");
+    return -1;
+}
+
+static int prepare_transfer_file(
+    TransferFile *file,
+    const char *path,
+    uint32_t file_index,
+    uint32_t file_type
+) {
+    const char *base_name = base_name_from_path(path);
+
+    if (!sanitize_filename(base_name)) {
+        printf("Unsafe file name: %s\n", base_name);
         return -1;
     }
 
-    copy_text(file_name, sizeof(file_name), base_name);
-
-    if (compute_file_sha256(file_path, file_hash, &file_size) != 0) {
-        printf("Failed to open/hash .onnx file\n");
+    if ((file_type == FILE_TYPE_ONNX && !has_onnx_extension(path)) ||
+        (file_type == FILE_TYPE_YAML && !has_yaml_extension(path))) {
+        printf("File extension does not match expected transfer type\n");
         return -1;
     }
 
-    if (file_size == 0 || file_size > MAX_FILE_SIZE) {
+    memset(file, 0, sizeof(*file));
+    file->path = path;
+    file->file_index = file_index;
+    file->file_type = file_type;
+    copy_text(file->file_name, sizeof(file->file_name), base_name);
+
+    if (compute_file_sha256(path, file->file_sha256, &file->file_size) != 0) {
+        printf("Failed to open/hash file: %s\n", path);
+        return -1;
+    }
+
+    if (file->file_size == 0 || file->file_size > MAX_FILE_SIZE) {
         printf("Invalid file size. Max allowed is %llu bytes\n", (unsigned long long)MAX_FILE_SIZE);
         return -1;
     }
 
-    total_chunks = (uint32_t)((file_size + CHUNK_SIZE - 1) / CHUNK_SIZE);
+    file->total_chunks = (uint32_t)((file->file_size + CHUNK_SIZE - 1) / CHUNK_SIZE);
+    return 0;
+}
+
+static int transfer_files_session(
+    SOCKET data_sock,
+    const struct sockaddr_in *robot_data_addr,
+    SecureSession *session,
+    const char *robot_id,
+    TransferFile *files,
+    uint32_t file_count
+) {
+    uint64_t transfer_id = 0;
+    unsigned char session_hash[crypto_hash_sha256_BYTES];
+
+    if (file_count == 0 || file_count > MAX_TRANSFER_FILES) {
+        return -1;
+    }
+
+    randombytes_buf(&transfer_id, sizeof(transfer_id));
+    compute_session_hash(files, file_count, session_hash);
+
+    printf("Starting multi-file transfer session\n");
+
+    if (send_session_start(
+            data_sock,
+            robot_data_addr,
+            session,
+            transfer_id,
+            file_count
+        ) != 0) {
+        return -1;
+    }
+
+    if (send_session_metadata(
+            data_sock,
+            robot_data_addr,
+            session,
+            transfer_id,
+            robot_id,
+            files,
+            file_count
+        ) != 0) {
+        return -1;
+    }
+
+    for (uint32_t i = 0; i < file_count; i++) {
+        int file_done = 0;
+
+        for (int attempt = 1; attempt <= 3 && !file_done; attempt++) {
+            printf(
+                "Sending file %u/%u: %s\n",
+                i + 1,
+                file_count,
+                files[i].file_name
+            );
+
+            if (attempt > 1) {
+                printf("Retrying file index %u only (attempt %d)\n", files[i].file_index, attempt);
+            }
+
+            if (send_file_start(
+                    data_sock,
+                    robot_data_addr,
+                    session,
+                    transfer_id,
+                    files[i].file_index
+                ) != 0) {
+                continue;
+            }
+
+            if (send_file_chunks(
+                    data_sock,
+                    robot_data_addr,
+                    session,
+                    files[i].path,
+                    transfer_id,
+                    files[i].file_index,
+                    files[i].file_size,
+                    files[i].total_chunks
+                ) != 0) {
+                continue;
+            }
+
+            if (handle_file_complete(
+                    data_sock,
+                    robot_data_addr,
+                    session,
+                    transfer_id,
+                    files[i].file_index
+                ) != 0) {
+                continue;
+            }
+
+            file_done = 1;
+        }
+
+        if (!file_done) {
+            return -1;
+        }
+    }
+
+    if (send_session_complete(
+            data_sock,
+            robot_data_addr,
+            session,
+            transfer_id,
+            session_hash
+        ) != 0) {
+        return -1;
+    }
+
+    printf("Session completed successfully\n");
+    return 0;
+}
+
+static int transfer_onnx_file(
+    SOCKET data_sock,
+    const struct sockaddr_in *robot_data_addr,
+    SecureSession *session,
+    const char *robot_id,
+    const char *file_path
+) {
+    TransferFile file;
+    uint64_t transfer_id = 0;
+
+    (void)robot_id;
+
+    if (prepare_transfer_file(&file, file_path, 0, FILE_TYPE_ONNX) != 0) {
+        printf("Only safe .onnx file names are allowed\n");
+        return -1;
+    }
+
     randombytes_buf(&transfer_id, sizeof(transfer_id));
 
     printf(
         "Sending .onnx file: %s | size=%llu | chunks=%u\n",
-        file_name,
-        (unsigned long long)file_size,
-        total_chunks
+        file.file_name,
+        (unsigned long long)file.file_size,
+        file.total_chunks
     );
 
     if (send_file_metadata(
@@ -1453,10 +1921,10 @@ static int transfer_onnx_file(
             robot_data_addr,
             session,
             transfer_id,
-            file_name,
-            file_size,
-            total_chunks,
-            file_hash
+            file.file_name,
+            file.file_size,
+            file.total_chunks,
+            file.file_sha256
         ) != 0) {
         return -1;
     }
@@ -1465,10 +1933,11 @@ static int transfer_onnx_file(
             data_sock,
             robot_data_addr,
             session,
-            file_path,
+            file.path,
             transfer_id,
-            file_size,
-            total_chunks
+            file.file_index,
+            file.file_size,
+            file.total_chunks
         ) != 0) {
         return -1;
     }
@@ -1477,7 +1946,36 @@ static int transfer_onnx_file(
         data_sock,
         robot_data_addr,
         session,
-        transfer_id
+        transfer_id,
+        file.file_index
+    );
+}
+
+static int transfer_model_and_config_files(
+    SOCKET data_sock,
+    const struct sockaddr_in *robot_data_addr,
+    SecureSession *session,
+    const char *robot_id,
+    const char *onnx_path,
+    const char *yaml_path
+) {
+    TransferFile files[MAX_TRANSFER_FILES];
+
+    if (prepare_transfer_file(&files[0], onnx_path, 0, FILE_TYPE_ONNX) != 0) {
+        return -1;
+    }
+
+    if (prepare_transfer_file(&files[1], yaml_path, 1, FILE_TYPE_YAML) != 0) {
+        return -1;
+    }
+
+    return transfer_files_session(
+        data_sock,
+        robot_data_addr,
+        session,
+        robot_id,
+        files,
+        2
     );
 }
 
@@ -1909,6 +2407,7 @@ int main() {
     }
 
     char onnx_path[512];
+    char yaml_path[512];
 
     printf("Enter .onnx file path to send: ");
 
@@ -1922,20 +2421,48 @@ int main() {
 
     remove_newline(onnx_path);
 
-    if (transfer_onnx_file(
-            data_sock,
-            &robot_data_addr,
-            &session,
-            onnx_path
-        ) != 0) {
-        printf("Secure .onnx file transfer failed.\n");
-        closesocket(data_sock);
-        closesocket(discovery_sock);
-        WSACleanup();
-        return 1;
+    printf("Enter .yaml file path to send with it, or press Enter for single-file mode: ");
+
+    if (fgets(yaml_path, sizeof(yaml_path), stdin) == NULL) {
+        yaml_path[0] = '\0';
     }
 
-    printf("Secure .onnx file transfer finished.\n");
+    remove_newline(yaml_path);
+
+    if (yaml_path[0] == '\0') {
+        if (transfer_onnx_file(
+                data_sock,
+                &robot_data_addr,
+                &session,
+                selected_robot.device_id,
+                onnx_path
+            ) != 0) {
+            printf("Secure .onnx file transfer failed.\n");
+            closesocket(data_sock);
+            closesocket(discovery_sock);
+            WSACleanup();
+            return 1;
+        }
+
+        printf("Secure .onnx file transfer finished.\n");
+    } else {
+        if (transfer_model_and_config_files(
+                data_sock,
+                &robot_data_addr,
+                &session,
+                selected_robot.device_id,
+                onnx_path,
+                yaml_path
+            ) != 0) {
+            printf("Secure model/config file transfer failed.\n");
+            closesocket(data_sock);
+            closesocket(discovery_sock);
+            WSACleanup();
+            return 1;
+        }
+
+        printf("Secure model/config file transfer finished.\n");
+    }
 
     sodium_memzero(&session, sizeof(session));
     closesocket(data_sock);

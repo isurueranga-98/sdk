@@ -34,11 +34,15 @@
 #define UDP_BUFFER_SIZE (4 * 1024 * 1024)
 #define MAX_FILE_SIZE (100ULL * 1024ULL * 1024ULL)
 #define DOWNLOAD_DIR "downloads"
+#define RECEIVED_DIR "received"
 #define FILE_NAME_SIZE 128
 #define FILE_PATH_SIZE 256
 #define FILE_MESSAGE_SIZE 128
 #define ACK_MESSAGE_SIZE 64
 #define MAX_MISSING_LIST 256
+#define MAX_TRANSFER_FILES 2
+#define FILE_TYPE_ONNX 1
+#define FILE_TYPE_YAML 2
 #define FILE_PACKET_MAGIC "RFILE"
 #define MAX_FILE_PLAINTEXT_SIZE 1400
 #define MAX_FILE_CIPHERTEXT_SIZE \
@@ -60,7 +64,13 @@ enum {
     PACKET_TYPE_FILE_STATUS_RESPONSE = 6,
     PACKET_TYPE_FILE_COMPLETE_REQUEST = 7,
     PACKET_TYPE_FILE_COMPLETE_RESPONSE = 8,
-    PACKET_TYPE_FILE_TRANSFER_FAILED = 9
+    PACKET_TYPE_FILE_TRANSFER_FAILED = 9,
+    PACKET_TYPE_SESSION_START = 10,
+    PACKET_TYPE_SESSION_METADATA = 11,
+    PACKET_TYPE_FILE_START = 12,
+    PACKET_TYPE_FILE_COMPLETE = 13,
+    PACKET_TYPE_SESSION_COMPLETE = 14,
+    PACKET_TYPE_SESSION_ERROR = 15
 };
 
 #pragma pack(push, 1)
@@ -125,6 +135,55 @@ typedef struct {
 } FileMetaPlain;
 
 typedef struct {
+    uint32_t file_index;
+    uint32_t file_type;
+    char file_name[FILE_NAME_SIZE];
+    uint64_t file_size;
+    uint32_t chunk_size;
+    uint32_t total_chunks;
+    unsigned char file_sha256[crypto_hash_sha256_BYTES];
+} SessionFileInfoPlain;
+
+typedef struct {
+    char magic[MAGIC_SIZE];
+    uint32_t packet_type;
+    uint64_t transfer_id;
+    uint32_t sequence_number;
+    uint64_t timestamp;
+    uint32_t file_count;
+} SessionStartPlain;
+
+typedef struct {
+    char magic[MAGIC_SIZE];
+    uint32_t packet_type;
+    uint64_t transfer_id;
+    uint32_t sequence_number;
+    uint64_t timestamp;
+    char robot_id[DEVICE_ID_SIZE];
+    uint32_t file_count;
+    SessionFileInfoPlain files[MAX_TRANSFER_FILES];
+} SessionMetadataPlain;
+
+typedef struct {
+    char magic[MAGIC_SIZE];
+    uint32_t packet_type;
+    uint64_t transfer_id;
+    uint32_t sequence_number;
+    uint64_t timestamp;
+    int32_t accepted;
+    char message[FILE_MESSAGE_SIZE];
+} FileControlAckPlain;
+
+typedef struct {
+    char magic[MAGIC_SIZE];
+    uint32_t packet_type;
+    uint64_t transfer_id;
+    uint32_t sequence_number;
+    uint64_t timestamp;
+    uint32_t file_index;
+} FileStartPlain;
+
+typedef struct {
     char magic[MAGIC_SIZE];
     uint32_t packet_type;
     uint64_t transfer_id;
@@ -140,6 +199,7 @@ typedef struct {
     uint64_t transfer_id;
     uint32_t sequence_number;
     uint64_t timestamp;
+    uint32_t file_index;
     uint32_t chunk_index;
     uint32_t chunk_size;
     uint64_t offset;
@@ -152,6 +212,7 @@ typedef struct {
     uint64_t transfer_id;
     uint32_t sequence_number;
     uint64_t timestamp;
+    uint32_t file_index;
     uint32_t chunk_index;
     int32_t status;
     char message[ACK_MESSAGE_SIZE];
@@ -163,6 +224,7 @@ typedef struct {
     uint64_t transfer_id;
     uint32_t sequence_number;
     uint64_t timestamp;
+    uint32_t file_index;
 } FileStatusRequestPlain;
 
 typedef struct {
@@ -171,6 +233,7 @@ typedef struct {
     uint64_t transfer_id;
     uint32_t sequence_number;
     uint64_t timestamp;
+    uint32_t file_index;
     uint32_t total_chunks;
     uint32_t received_chunks;
     uint32_t missing_count;
@@ -183,6 +246,7 @@ typedef struct {
     uint64_t transfer_id;
     uint32_t sequence_number;
     uint64_t timestamp;
+    uint32_t file_index;
 } FileCompleteRequestPlain;
 
 typedef struct {
@@ -191,11 +255,21 @@ typedef struct {
     uint64_t transfer_id;
     uint32_t sequence_number;
     uint64_t timestamp;
+    uint32_t file_index;
     int32_t success;
     char final_file_path[FILE_PATH_SIZE];
     unsigned char computed_sha256[crypto_hash_sha256_BYTES];
     char message[FILE_MESSAGE_SIZE];
 } FileCompleteResponsePlain;
+
+typedef struct {
+    char magic[MAGIC_SIZE];
+    uint32_t packet_type;
+    uint64_t transfer_id;
+    uint32_t sequence_number;
+    uint64_t timestamp;
+    unsigned char session_sha256[crypto_hash_sha256_BYTES];
+} SessionCompletePlain;
 
 typedef struct {
     char magic[MAGIC_SIZE];
@@ -237,6 +311,7 @@ typedef struct {
     int active;
     int complete;
     uint64_t transfer_id;
+    uint32_t file_index;
     char file_name[FILE_NAME_SIZE];
     char part_path[FILE_PATH_SIZE];
     char final_path[FILE_PATH_SIZE];
@@ -248,6 +323,17 @@ typedef struct {
     unsigned char *received_bitmap;
     FILE *file;
 } FileTransferState;
+
+typedef struct {
+    int active;
+    uint64_t transfer_id;
+    uint32_t file_count;
+    uint32_t completed_count;
+    char session_dir[FILE_PATH_SIZE];
+    SessionFileInfoPlain files[MAX_TRANSFER_FILES];
+    unsigned char completed_hashes[MAX_TRANSFER_FILES][crypto_hash_sha256_BYTES];
+    unsigned char completed_bitmap[MAX_TRANSFER_FILES];
+} MultiFileSessionState;
 
 static int hex_to_bytes(const char *hex, unsigned char *output, size_t output_size) {
     size_t hex_len = strlen(hex);
@@ -299,6 +385,20 @@ static int has_onnx_extension(const char *file_name) {
     return strcmp(file_name + length - 5, ".onnx") == 0;
 }
 
+static int has_yaml_extension(const char *file_name) {
+    size_t length = strlen(file_name);
+
+    if (length >= 5 && strcmp(file_name + length - 5, ".yaml") == 0) {
+        return 1;
+    }
+
+    if (length >= 4 && strcmp(file_name + length - 4, ".yml") == 0) {
+        return 1;
+    }
+
+    return 0;
+}
+
 static int sanitize_filename(const char *file_name) {
     if (file_name == NULL || file_name[0] == '\0') {
         return 0;
@@ -312,7 +412,7 @@ static int sanitize_filename(const char *file_name) {
         return 0;
     }
 
-    return has_onnx_extension(file_name);
+    return has_onnx_extension(file_name) || has_yaml_extension(file_name);
 }
 
 static int create_downloads_directory(void) {
@@ -324,6 +424,22 @@ static int create_downloads_directory(void) {
         struct stat st;
 
         if (stat(DOWNLOAD_DIR, &st) == 0 && S_ISDIR(st.st_mode)) {
+            return 0;
+        }
+    }
+
+    return -1;
+}
+
+static int create_directory_if_missing(const char *path) {
+    if (mkdir(path, 0700) == 0) {
+        return 0;
+    }
+
+    if (errno == EEXIST) {
+        struct stat st;
+
+        if (stat(path, &st) == 0 && S_ISDIR(st.st_mode)) {
             return 0;
         }
     }
@@ -367,6 +483,10 @@ static void cleanup_file_transfer(FileTransferState *transfer) {
     free(transfer->received_bitmap);
     transfer->received_bitmap = NULL;
     memset(transfer, 0, sizeof(*transfer));
+}
+
+static void cleanup_multi_file_session(MultiFileSessionState *multi) {
+    memset(multi, 0, sizeof(*multi));
 }
 
 static int encrypt_packet(
@@ -846,6 +966,30 @@ static void send_meta_ack(
     send_encrypted_packet(data_sock, client_addr, client_len, session, &ack, sizeof(ack));
 }
 
+static void send_control_ack(
+    int data_sock,
+    const struct sockaddr_in *client_addr,
+    socklen_t client_len,
+    const SecureSession *session,
+    uint64_t transfer_id,
+    uint32_t sequence_number,
+    int accepted,
+    const char *message
+) {
+    FileControlAckPlain ack;
+    memset(&ack, 0, sizeof(ack));
+
+    copy_text(ack.magic, MAGIC_SIZE, FILE_PACKET_MAGIC);
+    ack.packet_type = accepted ? PACKET_TYPE_FILE_META_ACK : PACKET_TYPE_SESSION_ERROR;
+    ack.transfer_id = transfer_id;
+    ack.sequence_number = sequence_number;
+    ack.timestamp = (uint64_t)time(NULL);
+    ack.accepted = accepted;
+    copy_text(ack.message, sizeof(ack.message), message);
+
+    send_encrypted_packet(data_sock, client_addr, client_len, session, &ack, sizeof(ack));
+}
+
 static void send_chunk_ack(
     int data_sock,
     const struct sockaddr_in *client_addr,
@@ -853,6 +997,7 @@ static void send_chunk_ack(
     const SecureSession *session,
     uint64_t transfer_id,
     uint32_t sequence_number,
+    uint32_t file_index,
     uint32_t chunk_index,
     int status,
     const char *message
@@ -865,6 +1010,7 @@ static void send_chunk_ack(
     ack.transfer_id = transfer_id;
     ack.sequence_number = sequence_number;
     ack.timestamp = (uint64_t)time(NULL);
+    ack.file_index = file_index;
     ack.chunk_index = chunk_index;
     ack.status = status;
     copy_text(ack.message, sizeof(ack.message), message);
@@ -1029,6 +1175,7 @@ static int handle_file_metadata(
 
     new_transfer.active = 1;
     new_transfer.transfer_id = meta->transfer_id;
+    new_transfer.file_index = 0;
     new_transfer.file_size = meta->file_size;
     new_transfer.chunk_size = meta->chunk_size;
     new_transfer.total_chunks = meta->total_chunks;
@@ -1061,6 +1208,304 @@ static int handle_file_metadata(
     return 0;
 }
 
+static int valid_session_file_info(const SessionFileInfoPlain *info, uint32_t expected_index) {
+    if (info->file_index != expected_index ||
+        !sanitize_filename(info->file_name) ||
+        info->file_size == 0 ||
+        info->file_size > MAX_FILE_SIZE ||
+        info->chunk_size == 0 ||
+        info->chunk_size > CHUNK_SIZE ||
+        info->total_chunks == 0 ||
+        info->total_chunks !=
+            (uint32_t)((info->file_size + info->chunk_size - 1) / info->chunk_size)) {
+        return 0;
+    }
+
+    if (info->file_type == FILE_TYPE_ONNX) {
+        return has_onnx_extension(info->file_name);
+    }
+
+    if (info->file_type == FILE_TYPE_YAML) {
+        return has_yaml_extension(info->file_name);
+    }
+
+    return 0;
+}
+
+static void handle_session_start(
+    int data_sock,
+    const struct sockaddr_in *client_addr,
+    socklen_t client_len,
+    const SecureSession *session,
+    FileTransferState *transfer,
+    MultiFileSessionState *multi,
+    const SessionStartPlain *start
+) {
+    if (strncmp(start->magic, FILE_PACKET_MAGIC, MAGIC_SIZE) != 0 ||
+        start->packet_type != PACKET_TYPE_SESSION_START ||
+        !is_timestamp_fresh(start->timestamp) ||
+        start->file_count == 0 ||
+        start->file_count > MAX_TRANSFER_FILES) {
+        return;
+    }
+
+    cleanup_file_transfer(transfer);
+    cleanup_multi_file_session(multi);
+
+    multi->active = 1;
+    multi->transfer_id = start->transfer_id;
+    multi->file_count = start->file_count;
+
+    send_control_ack(
+        data_sock,
+        client_addr,
+        client_len,
+        session,
+        start->transfer_id,
+        start->sequence_number,
+        1,
+        "Session start accepted"
+    );
+
+    printf(
+        "Starting multi-file transfer session | id=%llu files=%u\n",
+        (unsigned long long)start->transfer_id,
+        start->file_count
+    );
+}
+
+static void handle_session_metadata(
+    int data_sock,
+    const struct sockaddr_in *client_addr,
+    socklen_t client_len,
+    const SecureSession *session,
+    MultiFileSessionState *multi,
+    const SessionMetadataPlain *metadata
+) {
+    if (!multi->active ||
+        metadata->transfer_id != multi->transfer_id ||
+        metadata->file_count != multi->file_count ||
+        !is_timestamp_fresh(metadata->timestamp)) {
+        send_control_ack(
+            data_sock,
+            client_addr,
+            client_len,
+            session,
+            metadata->transfer_id,
+            metadata->sequence_number,
+            0,
+            "Invalid session metadata"
+        );
+        return;
+    }
+
+    if (create_directory_if_missing(RECEIVED_DIR) != 0) {
+        send_control_ack(
+            data_sock,
+            client_addr,
+            client_len,
+            session,
+            metadata->transfer_id,
+            metadata->sequence_number,
+            0,
+            "Cannot create received directory"
+        );
+        return;
+    }
+
+    snprintf(
+        multi->session_dir,
+        sizeof(multi->session_dir),
+        "%s/%llu",
+        RECEIVED_DIR,
+        (unsigned long long)metadata->transfer_id
+    );
+
+    if (create_directory_if_missing(multi->session_dir) != 0) {
+        send_control_ack(
+            data_sock,
+            client_addr,
+            client_len,
+            session,
+            metadata->transfer_id,
+            metadata->sequence_number,
+            0,
+            "Cannot create session directory"
+        );
+        return;
+    }
+
+    for (uint32_t i = 0; i < metadata->file_count; i++) {
+        if (!valid_session_file_info(&metadata->files[i], i)) {
+            send_control_ack(
+                data_sock,
+                client_addr,
+                client_len,
+                session,
+                metadata->transfer_id,
+                metadata->sequence_number,
+                0,
+                "Invalid file metadata"
+            );
+            return;
+        }
+
+        multi->files[i] = metadata->files[i];
+    }
+
+    send_control_ack(
+        data_sock,
+        client_addr,
+        client_len,
+        session,
+        metadata->transfer_id,
+        metadata->sequence_number,
+        1,
+        "Session metadata accepted"
+    );
+}
+
+static void handle_file_start(
+    int data_sock,
+    const struct sockaddr_in *client_addr,
+    socklen_t client_len,
+    const SecureSession *session,
+    FileTransferState *transfer,
+    MultiFileSessionState *multi,
+    const FileStartPlain *start
+) {
+    if (!multi->active ||
+        start->transfer_id != multi->transfer_id ||
+        start->file_index >= multi->file_count ||
+        !is_timestamp_fresh(start->timestamp)) {
+        send_control_ack(
+            data_sock,
+            client_addr,
+            client_len,
+            session,
+            start->transfer_id,
+            start->sequence_number,
+            0,
+            "Invalid file start"
+        );
+        return;
+    }
+
+    if (multi->completed_bitmap[start->file_index]) {
+        send_control_ack(
+            data_sock,
+            client_addr,
+            client_len,
+            session,
+            start->transfer_id,
+            start->sequence_number,
+            1,
+            "File already complete"
+        );
+        return;
+    }
+
+    const SessionFileInfoPlain *info = &multi->files[start->file_index];
+    FileTransferState new_transfer;
+    memset(&new_transfer, 0, sizeof(new_transfer));
+
+    new_transfer.received_bitmap = (unsigned char *)calloc(info->total_chunks, 1);
+
+    if (new_transfer.received_bitmap == NULL) {
+        send_control_ack(
+            data_sock,
+            client_addr,
+            client_len,
+            session,
+            start->transfer_id,
+            start->sequence_number,
+            0,
+            "Out of memory"
+        );
+        return;
+    }
+
+    copy_text(new_transfer.file_name, sizeof(new_transfer.file_name), info->file_name);
+    snprintf(
+        new_transfer.part_path,
+        sizeof(new_transfer.part_path),
+        "%s/%s.part",
+        multi->session_dir,
+        new_transfer.file_name
+    );
+    snprintf(
+        new_transfer.final_path,
+        sizeof(new_transfer.final_path),
+        "%s/%s",
+        multi->session_dir,
+        new_transfer.file_name
+    );
+
+    if (access(new_transfer.final_path, F_OK) == 0) {
+        free(new_transfer.received_bitmap);
+        send_control_ack(
+            data_sock,
+            client_addr,
+            client_len,
+            session,
+            start->transfer_id,
+            start->sequence_number,
+            0,
+            "Final file already exists"
+        );
+        return;
+    }
+
+    new_transfer.file = fopen(new_transfer.part_path, "w+b");
+
+    if (new_transfer.file == NULL) {
+        free(new_transfer.received_bitmap);
+        send_control_ack(
+            data_sock,
+            client_addr,
+            client_len,
+            session,
+            start->transfer_id,
+            start->sequence_number,
+            0,
+            "Cannot create output file"
+        );
+        return;
+    }
+
+    cleanup_file_transfer(transfer);
+
+    new_transfer.active = 1;
+    new_transfer.transfer_id = start->transfer_id;
+    new_transfer.file_index = start->file_index;
+    new_transfer.file_size = info->file_size;
+    new_transfer.chunk_size = info->chunk_size;
+    new_transfer.total_chunks = info->total_chunks;
+    memcpy(new_transfer.expected_sha256, info->file_sha256, crypto_hash_sha256_BYTES);
+
+    *transfer = new_transfer;
+
+    send_control_ack(
+        data_sock,
+        client_addr,
+        client_len,
+        session,
+        start->transfer_id,
+        start->sequence_number,
+        1,
+        "File start accepted"
+    );
+
+    printf(
+        "File transfer accepted | session=%llu index=%u name=%s size=%llu chunks=%u\n",
+        (unsigned long long)transfer->transfer_id,
+        transfer->file_index,
+        transfer->file_name,
+        (unsigned long long)transfer->file_size,
+        transfer->total_chunks
+    );
+}
+
 static void handle_file_chunk(
     int data_sock,
     const struct sockaddr_in *client_addr,
@@ -1074,6 +1519,7 @@ static void handle_file_chunk(
 
     if (!transfer->active ||
         chunk->transfer_id != transfer->transfer_id ||
+        chunk->file_index != transfer->file_index ||
         !is_timestamp_fresh(chunk->timestamp) ||
         chunk->chunk_index >= transfer->total_chunks ||
         chunk->chunk_size == 0 ||
@@ -1086,6 +1532,7 @@ static void handle_file_chunk(
             session,
             chunk->transfer_id,
             chunk->sequence_number,
+            chunk->file_index,
             chunk->chunk_index,
             0,
             "Invalid chunk"
@@ -1108,6 +1555,7 @@ static void handle_file_chunk(
             session,
             chunk->transfer_id,
             chunk->sequence_number,
+            chunk->file_index,
             chunk->chunk_index,
             0,
             "Chunk offset/size mismatch"
@@ -1123,6 +1571,7 @@ static void handle_file_chunk(
             session,
             transfer->transfer_id,
             chunk->sequence_number,
+            transfer->file_index,
             chunk->chunk_index,
             1,
             "Duplicate ACK"
@@ -1139,6 +1588,7 @@ static void handle_file_chunk(
             session,
             transfer->transfer_id,
             chunk->sequence_number,
+            transfer->file_index,
             chunk->chunk_index,
             0,
             "File write failed"
@@ -1156,6 +1606,7 @@ static void handle_file_chunk(
         session,
         transfer->transfer_id,
         chunk->sequence_number,
+        transfer->file_index,
         chunk->chunk_index,
         1,
         "OK"
@@ -1178,8 +1629,11 @@ static void handle_file_status_request(
     response.transfer_id = request->transfer_id;
     response.sequence_number = request->sequence_number;
     response.timestamp = (uint64_t)time(NULL);
+    response.file_index = request->file_index;
 
-    if (transfer->active && request->transfer_id == transfer->transfer_id) {
+    if (transfer->active &&
+        request->transfer_id == transfer->transfer_id &&
+        request->file_index == transfer->file_index) {
         response.total_chunks = transfer->total_chunks;
         response.received_chunks = transfer->received_chunks;
 
@@ -1208,6 +1662,7 @@ static void handle_file_complete(
     socklen_t client_len,
     const SecureSession *session,
     FileTransferState *transfer,
+    MultiFileSessionState *multi,
     const FileCompleteRequestPlain *request
 ) {
     FileCompleteResponsePlain response;
@@ -1220,8 +1675,11 @@ static void handle_file_complete(
     response.transfer_id = request->transfer_id;
     response.sequence_number = request->sequence_number;
     response.timestamp = (uint64_t)time(NULL);
+    response.file_index = request->file_index;
 
-    if (!transfer->active || request->transfer_id != transfer->transfer_id) {
+    if (!transfer->active ||
+        request->transfer_id != transfer->transfer_id ||
+        request->file_index != transfer->file_index) {
         copy_text(response.message, sizeof(response.message), "No active transfer");
     } else if (transfer->received_chunks != transfer->total_chunks) {
         copy_text(response.message, sizeof(response.message), "Missing chunks");
@@ -1250,6 +1708,19 @@ static void handle_file_complete(
                 transfer->complete = 1;
                 copy_text(response.final_file_path, sizeof(response.final_file_path), transfer->final_path);
                 copy_text(response.message, sizeof(response.message), "File transfer complete");
+
+                if (multi->active &&
+                    multi->transfer_id == transfer->transfer_id &&
+                    transfer->file_index < multi->file_count &&
+                    !multi->completed_bitmap[transfer->file_index]) {
+                    memcpy(
+                        multi->completed_hashes[transfer->file_index],
+                        computed_hash,
+                        crypto_hash_sha256_BYTES
+                    );
+                    multi->completed_bitmap[transfer->file_index] = 1;
+                    multi->completed_count++;
+                }
             }
         }
     }
@@ -1271,12 +1742,114 @@ static void handle_file_complete(
     }
 }
 
+static void compute_session_hash(
+    const MultiFileSessionState *multi,
+    unsigned char session_hash[crypto_hash_sha256_BYTES]
+) {
+    crypto_hash_sha256_state state;
+
+    crypto_hash_sha256_init(&state);
+
+    for (uint32_t i = 0; i < multi->file_count; i++) {
+        crypto_hash_sha256_update(
+            &state,
+            multi->completed_hashes[i],
+            crypto_hash_sha256_BYTES
+        );
+    }
+
+    crypto_hash_sha256_final(&state, session_hash);
+}
+
+static void handle_session_complete(
+    int data_sock,
+    const struct sockaddr_in *client_addr,
+    socklen_t client_len,
+    const SecureSession *session,
+    FileTransferState *transfer,
+    MultiFileSessionState *multi,
+    const SessionCompletePlain *complete
+) {
+    unsigned char session_hash[crypto_hash_sha256_BYTES];
+
+    if (!multi->active ||
+        complete->transfer_id != multi->transfer_id ||
+        !is_timestamp_fresh(complete->timestamp)) {
+        send_control_ack(
+            data_sock,
+            client_addr,
+            client_len,
+            session,
+            complete->transfer_id,
+            complete->sequence_number,
+            0,
+            "Invalid session complete"
+        );
+        return;
+    }
+
+    if (multi->completed_count != multi->file_count) {
+        send_control_ack(
+            data_sock,
+            client_addr,
+            client_len,
+            session,
+            complete->transfer_id,
+            complete->sequence_number,
+            0,
+            "Not all files complete"
+        );
+        return;
+    }
+
+    compute_session_hash(multi, session_hash);
+
+    if (sodium_memcmp(
+            session_hash,
+            complete->session_sha256,
+            crypto_hash_sha256_BYTES
+        ) != 0) {
+        send_control_ack(
+            data_sock,
+            client_addr,
+            client_len,
+            session,
+            complete->transfer_id,
+            complete->sequence_number,
+            0,
+            "Session SHA-256 mismatch"
+        );
+        return;
+    }
+
+    send_control_ack(
+        data_sock,
+        client_addr,
+        client_len,
+        session,
+        complete->transfer_id,
+        complete->sequence_number,
+        1,
+        "Session completed successfully"
+    );
+
+    printf(
+        "Session completed successfully | id=%llu dir=%s\n",
+        (unsigned long long)multi->transfer_id,
+        multi->session_dir
+    );
+
+    cleanup_file_transfer(transfer);
+    cleanup_multi_file_session(multi);
+}
+
 static void handle_file_packet(
     int data_sock,
     const struct sockaddr_in *client_addr,
     socklen_t client_len,
     const SecureSession *session,
     FileTransferState *transfer,
+    MultiFileSessionState *multi,
     const EncryptedFilePacket *packet,
     size_t packet_len
 ) {
@@ -1314,6 +1887,47 @@ static void handle_file_packet(
     memcpy(&packet_type, plain + MAGIC_SIZE, sizeof(packet_type));
 
     switch (packet_type) {
+        case PACKET_TYPE_SESSION_START:
+            if (plain_len == sizeof(SessionStartPlain)) {
+                handle_session_start(
+                    data_sock,
+                    client_addr,
+                    client_len,
+                    session,
+                    transfer,
+                    multi,
+                    (const SessionStartPlain *)plain
+                );
+            }
+            break;
+
+        case PACKET_TYPE_SESSION_METADATA:
+            if (plain_len == sizeof(SessionMetadataPlain)) {
+                handle_session_metadata(
+                    data_sock,
+                    client_addr,
+                    client_len,
+                    session,
+                    multi,
+                    (const SessionMetadataPlain *)plain
+                );
+            }
+            break;
+
+        case PACKET_TYPE_FILE_START:
+            if (plain_len == sizeof(FileStartPlain)) {
+                handle_file_start(
+                    data_sock,
+                    client_addr,
+                    client_len,
+                    session,
+                    transfer,
+                    multi,
+                    (const FileStartPlain *)plain
+                );
+            }
+            break;
+
         case PACKET_TYPE_FILE_META:
             if (plain_len == sizeof(FileMetaPlain)) {
                 handle_file_metadata(
@@ -1354,6 +1968,7 @@ static void handle_file_packet(
             break;
 
         case PACKET_TYPE_FILE_COMPLETE_REQUEST:
+        case PACKET_TYPE_FILE_COMPLETE:
             if (plain_len == sizeof(FileCompleteRequestPlain)) {
                 handle_file_complete(
                     data_sock,
@@ -1361,7 +1976,22 @@ static void handle_file_packet(
                     client_len,
                     session,
                     transfer,
+                    multi,
                     (const FileCompleteRequestPlain *)plain
+                );
+            }
+            break;
+
+        case PACKET_TYPE_SESSION_COMPLETE:
+            if (plain_len == sizeof(SessionCompletePlain)) {
+                handle_session_complete(
+                    data_sock,
+                    client_addr,
+                    client_len,
+                    session,
+                    transfer,
+                    multi,
+                    (const SessionCompletePlain *)plain
                 );
             }
             break;
@@ -1384,7 +2014,8 @@ static void handle_data_socket(
     int data_sock,
     const RobotIdentity *identity,
     SecureSession *session,
-    FileTransferState *transfer
+    FileTransferState *transfer,
+    MultiFileSessionState *multi
 ) {
     unsigned char buffer[2048];
     struct sockaddr_in client_addr;
@@ -1419,6 +2050,7 @@ static void handle_data_socket(
             client_len
         );
         cleanup_file_transfer(transfer);
+        cleanup_multi_file_session(multi);
         return;
     }
 
@@ -1429,6 +2061,7 @@ static void handle_data_socket(
             client_len,
             session,
             transfer,
+            multi,
             (EncryptedFilePacket *)buffer,
             (size_t)received
         );
@@ -1506,6 +2139,9 @@ int main() {
     FileTransferState transfer;
     memset(&transfer, 0, sizeof(transfer));
 
+    MultiFileSessionState multi;
+    memset(&multi, 0, sizeof(multi));
+
     while (1) {
         fd_set read_fds;
         FD_ZERO(&read_fds);
@@ -1526,11 +2162,12 @@ int main() {
         }
 
         if (FD_ISSET(data_sock, &read_fds)) {
-            handle_data_socket(data_sock, &identity, &session, &transfer);
+            handle_data_socket(data_sock, &identity, &session, &transfer, &multi);
         }
     }
 
     cleanup_file_transfer(&transfer);
+    cleanup_multi_file_session(&multi);
     sodium_memzero(&session, sizeof(session));
     close(discovery_sock);
     close(data_sock);
